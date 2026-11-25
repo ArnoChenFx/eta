@@ -7,8 +7,8 @@ publish = false
 [workspace]
 
 [dependencies]
-nsh-base = { git = "https://github.com/longbridge/nsh", tag = "v0.4.0" }
-nsh-core = { git = "https://github.com/longbridge/nsh", tag = "v0.4.0" }
+nsh-base = { git = "https://github.com/longbridge/nsh", rev = "7d701ea67e3d523094f681d453b73b5f7d87a5c8" }
+nsh-core = { git = "https://github.com/longbridge/nsh", rev = "7d701ea67e3d523094f681d453b73b5f7d87a5c8" }
 
 [target.'cfg(target_os = "ios")'.dependencies]
 block2 = "0.6"
