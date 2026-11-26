@@ -146,9 +146,9 @@ jobs:
           git clone https://github.com/huacnlee/nsh-platform-harmonyos.git "$src"
           git -C "$src" checkout "$commit"
           if [[ -n "$full_rev" ]]; then
-            python3 apps/mobile/scripts/patch-harmonyos.py platform "$src" --nsh-rev "$full_rev"
+            python3 scripts/patch-harmonyos.py platform "$src" --nsh-rev "$full_rev"
           else
-            python3 apps/mobile/scripts/patch-harmonyos.py platform "$src"
+            python3 scripts/patch-harmonyos.py platform "$src"
           fi
           echo "NSH_HARMONYOS_SOURCE=$src" >> "$GITHUB_ENV"
 
@@ -167,7 +167,7 @@ jobs:
           export NODE_PATH="$HOME/hvigor/node_modules"
           export OHOS_BASE_SDK_HOME="$HOME/ohos-sdk"
           out="$RUNNER_TEMP/eta-client-harmonyos-out"
-          python3 apps/mobile/scripts/patch-harmonyos.py project "$out"
+          python3 scripts/patch-harmonyos.py project "$out"
           cd "$out"
           node "$HOME/hvigor/node_modules/@ohos/hvigor/bin/hvigor.js" assembleHap \
             --mode module -p product=default -p buildMode=release --no-daemon

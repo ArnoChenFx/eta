@@ -3,14 +3,6 @@
   "id": "dev.eta.mobile",
   "version": "0.1.0",
   "build": 1,
-  "icon": "../web/public/Eta-Logo.png",
-  "schemes": ["eta"],
-  "capabilities": {
-    "network": {
-      "hosts": ["*"]
-    },
-    "picker": true
-  },
   "theme": "theme.json",
   "tailwind": {
     "fontSize": {
@@ -26,17 +18,5 @@
       "gauge": 64
     }
   },
-  "rust": "native",
-  "dependencies": {
-    "nsh-platform-harmonyos": {
-      "github": "huacnlee/nsh-platform-harmonyos"
-    }
-  },
-  "harmonyos": {
-    "permissions": [
-      {
-        "name": "ohos.permission.GET_NETWORK_INFO"
-      }
-    ]
-  }
+  "rust": "native"
 }

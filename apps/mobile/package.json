@@ -8,7 +8,6 @@
   "scripts": {
     "dev": "nsh run DevApp.tsx --target ios",
     "ios": "scripts/package-ios.sh simulator",
-    "harmonyos": "scripts/package-harmonyos.sh --runtime-os openharmony",
     "lint": "eslint --cache --cache-location node_modules/.cache/eslint .",
     "mobile:check": "nsh check",
     "mobile:test": "nsh test"
