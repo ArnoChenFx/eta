@@ -16,7 +16,7 @@ import sys
 
 def replace_once(path: pathlib.Path, old: str, new: str) -> None:
     text = path.read_text(encoding="utf-8")
-    if new in text or old not in text:
+    if (new and new in text) or old not in text:
         return
     path.write_text(text.replace(old, new, 1), encoding="utf-8")
 
