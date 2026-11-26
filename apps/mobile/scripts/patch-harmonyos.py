@@ -32,6 +32,7 @@ def patch_platform(root: pathlib.Path) -> None:
         ('nsh-package = "0.6"', 'nsh-package = "0.7"'),
         ('nsh-dev = "0.6"', 'nsh-dev = "0.7"'),
         ('nsh-testing = { version = "0.6", default-features = false }', 'nsh-testing = { version = "0.7", default-features = false }'),
+        ('nsh-engine = { workspace = true, features = ["js"] }', 'nsh-engine = { workspace = true, features = ["js", "websocket"] }'),
     ]:
         text = text.replace(old, new)
     cargo.write_text(text, encoding="utf-8")

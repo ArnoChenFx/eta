@@ -31,5 +31,12 @@
     "nsh-platform-harmonyos": {
       "github": "huacnlee/nsh-platform-harmonyos"
     }
+  },
+  "harmonyos": {
+    "permissions": [
+      {
+        "name": "ohos.permission.GET_NETWORK_INFO"
+      }
+    ]
   }
 }
