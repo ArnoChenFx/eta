@@ -272,6 +272,22 @@ export class NativeSpeech {
         out.append(line)
     native_desktop.write_text("".join(out), encoding="utf-8")
 
+    # When `nsh package` runs with `--no-hap`, it skips linking local ArkTS packages.
+    # Mirror `nsh-platform-harmonyos`'s `link_packages()` so `hvigor` resolves `@nsh/harmonyos`.
+    entry_oh = root / "entry/oh_modules"
+    links = [
+        (entry_oh / "@nsh/harmonyos", (root / "nsh").resolve()),
+        (
+            entry_oh / "libnsh_platform_harmonyos.so",
+            (root / "nsh/src/main/cpp/types/libnsh_platform_harmonyos").resolve(),
+        ),
+    ]
+    for link_path, target_path in links:
+        link_path.parent.mkdir(parents=True, exist_ok=True)
+        if link_path.is_symlink() or link_path.exists():
+            link_path.unlink()
+        link_path.symlink_to(target_path)
+
 
 def main() -> int:
     args = sys.argv[1:]
