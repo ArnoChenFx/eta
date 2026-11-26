@@ -18,11 +18,7 @@ runs:
         target="$RUNNER_TEMP/eta-nsh"
         mkdir -p "$target"
         cd "$target"
-        # Native Shell nightly rather than a release tag: the Windows IME fix
-        # (longbridge/nsh#2497, merge commit d474e13) landed after v0.6.1 was cut, so no
-        # stable tag contains it yet. Move back to the first stable tag that does
-        # (v0.6.2 or later) as soon as one is published.
-        url="https://github.com/longbridge/nsh/releases/download/nightly/$archive"
+        url="https://github.com/longbridge/nsh/releases/download/v0.7.1/$archive"
         curl --fail --silent --show-error --location --retry 3 --output "$archive" "$url"
         curl --fail --silent --show-error --location --retry 3 --output checksum "$url.sha256"
         digest=$(awk 'NR == 1 { print $1 }' checksum)
