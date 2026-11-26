@@ -11,17 +11,13 @@
     "android": "../web/public/Eta-Logo.png",
     "web": "../web/public/Eta-Logo.png"
   },
-  "schemes": [
-    "eta"
-  ],
+  "schemes": ["eta"],
   "web": {
     "base": "/"
   },
   "capabilities": {
     "network": {
-      "hosts": [
-        "*"
-      ]
+      "hosts": ["*"]
     },
     "webview": {
       "hosts": [
@@ -29,9 +25,7 @@
         "eta-artifact.invalid",
         "eta-export.invalid"
       ],
-      "media": [
-        "camera"
-      ]
+      "media": ["camera"]
     },
     "clipboard": true,
     "picker": true,
@@ -43,31 +37,15 @@
         "${homeDir}",
         "/"
       ],
-      "write": [
-        "${dataDir}/artifact-exports",
-        "${dataDir}/downloads"
-      ]
+      "write": ["${dataDir}/artifact-exports", "${dataDir}/downloads"]
     },
     "openUrl": {
-      "schemes": [
-        "http",
-        "https",
-        "mailto"
-      ]
+      "schemes": ["http", "https", "mailto"]
     },
     "statusBar": true,
     "process": {
-      "execute": [
-        "eta-host",
-        "eta-host.exe",
-        "env",
-        "cmd.exe"
-      ],
-      "env": [
-        "XDG_DATA_HOME",
-        "ETA_RELEASES_URL",
-        "ETA_HOST_ORIGIN"
-      ]
+      "execute": ["eta-host", "eta-host.exe", "env", "cmd.exe"],
+      "env": ["XDG_DATA_HOME", "ETA_RELEASES_URL", "ETA_HOST_ORIGIN"]
     },
     "application": true
   },
