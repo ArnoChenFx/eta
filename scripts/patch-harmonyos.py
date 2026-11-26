@@ -272,6 +272,102 @@ export class NativeSpeech {
         out.append(line)
     native_desktop.write_text("".join(out), encoding="utf-8")
 
+    # Enable WebView camera/microphone permission requests (used by the QR code scanner).
+    native_webviews = ets / "NativeWebViews.ets"
+    replace_once(
+        native_webviews,
+        'import { FrameCallback, UIContext } from "@ohos.arkui.UIContext";',
+        'import { abilityAccessCtrl, Permissions } from "@kit.AbilityKit";\nimport { FrameCallback, UIContext } from "@ohos.arkui.UIContext";',
+    )
+    replace_once(
+        native_webviews,
+        """      .onShowFileSelector((event): boolean => {
+        if (!event) {
+          return false;
+        }
+        this.entry.selectFiles(event.fileSelector, event.result);
+        return true;
+      })""",
+        """      .mediaPlayGestureAccess(false)
+      .onPermissionRequest((event) => {
+        if (!event) {
+          return;
+        }
+        this.entry.handlePermissionRequest(event.request);
+      })
+      .onShowFileSelector((event): boolean => {
+        if (!event) {
+          return false;
+        }
+        this.entry.selectFiles(event.fileSelector, event.result);
+        return true;
+      })""",
+    )
+    replace_once(
+        native_webviews,
+        "  selectFiles(selector: FileSelectorParam, result: FileSelectorResult): void {",
+        """  handlePermissionRequest(request: PermissionRequest): void {
+    const epoch = this.epoch;
+    this.resolvePermissionRequest(request, epoch).catch((error: Error) => {
+      console.warn(`NSH WebView permission request: ${String(error)}`);
+      try {
+        request.deny();
+      } catch {}
+    });
+  }
+
+  private async resolvePermissionRequest(
+    request: PermissionRequest,
+    epoch: number,
+  ): Promise<void> {
+    if (this.closed || !this.context.isActive() || epoch !== this.epoch) {
+      request.deny();
+      return;
+    }
+    const resources = request.getAccessibleResource();
+    const permissions: Permissions[] = [];
+    const grantedResources: string[] = [];
+    for (const resource of resources) {
+      if (resource === ProtectedResourceType.VIDEO_CAPTURE) {
+        permissions.push("ohos.permission.CAMERA");
+        grantedResources.push(resource);
+      } else if (resource === ProtectedResourceType.AUDIO_CAPTURE) {
+        permissions.push("ohos.permission.MICROPHONE");
+        grantedResources.push(resource);
+      }
+    }
+    if (permissions.length === 0) {
+      request.deny();
+      return;
+    }
+    const host = this.context.getUIContext().getHostContext();
+    if (!host) {
+      request.deny();
+      return;
+    }
+    const result = await abilityAccessCtrl
+      .createAtManager()
+      .requestPermissionsFromUser(host, permissions);
+    if (this.closed || !this.context.isActive() || epoch !== this.epoch) {
+      request.deny();
+      return;
+    }
+    const allowed: string[] = [];
+    for (let i = 0; i < grantedResources.length; i += 1) {
+      if (result.authResults[i] === 0) {
+        allowed.push(grantedResources[i]);
+      }
+    }
+    if (allowed.length > 0) {
+      request.grant(allowed);
+    } else {
+      request.deny();
+    }
+  }
+
+  selectFiles(selector: FileSelectorParam, result: FileSelectorResult): void {""",
+    )
+
     # When `nsh package` runs with `--no-hap`, it skips linking local ArkTS packages.
     # Mirror `nsh-platform-harmonyos`'s `link_packages()` so `hvigor` resolves `@nsh/harmonyos`.
     entry_oh = root / "entry/oh_modules"
