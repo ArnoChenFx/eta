@@ -8,17 +8,11 @@ import {
   SafeArea,
   Screen,
 } from "../../src/components";
-import {
-  createOptimisticStatus,
-  OptimisticStatus,
-} from "../../src/components/optimistic-status";
+import { NotificationHost } from "../../src/components/notifications";
 import { settled, shownWhile } from "../../src/components/pending";
-import {
-  ProgressNotificationLayer,
-  startProgress,
-} from "../../src/components/progress-notification";
+import { startProgress } from "../../src/components/progress-notification";
 import { SpinningIcon } from "../../src/components/spinner";
-import { showToast, ToastLayer } from "../../src/components/toast";
+import { showToast } from "../../src/components/toast";
 import { icon, space } from "../../src/components/tokens";
 
 function Fixture() {
@@ -29,7 +23,6 @@ function Fixture() {
   const events = signal<string[]>([]);
   const waiting = shownWhile(busy);
   const isSettled = settled(ready);
-  const optimistic = createOptimisticStatus();
   let activeProgress: ProgressHandle | undefined;
 
   const log = (entry: string) => events.update((all) => [...all, entry]);
@@ -143,33 +136,11 @@ function Fixture() {
               }}
             />
 
-            {/* OptimisticStatus */}
-            <OptimisticStatus
-              state={optimistic.state()}
-              onRetry={() => {
-                log("optimistic:retried");
-                optimistic.saving();
-              }}
-            />
-            <Button
-              label="Optimistic saving"
-              onPress={() => optimistic.saving()}
-            />
-            <Button
-              label="Optimistic saved"
-              onPress={() => optimistic.saved()}
-            />
-            <Button
-              label="Optimistic fail"
-              onPress={() => optimistic.fail("Network error")}
-            />
-
             <View testID="event-log">
               <Label>{events().join(",") || "events:none"}</Label>
             </View>
           </View>
-          <ToastLayer />
-          <ProgressNotificationLayer />
+          <NotificationHost />
         </SafeArea>
       </Screen.Provider>
     </Palette.Provider>
