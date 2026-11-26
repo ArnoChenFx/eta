@@ -1,5 +1,10 @@
-import type { ContextReading } from "@eta/client-contracts";
-import type { RunDelegateContext } from "@eta/core";
+import type { ContextReading, GenerationRate } from "@eta/client-contracts";
+import type {
+  AssistantMessage,
+  AssistantMessageEvent,
+  RunDelegateContext,
+  Usage,
+} from "@eta/core";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -83,6 +88,100 @@ it("reopens the per-field ledger, preserving explicit zeros and treating older n
   } finally {
     await manager.closeAll();
   }
+});
+
+/** Drives one generation through the frames a provider stream emits, on a clock the test sets. */
+async function scriptedGeneration() {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(0);
+  const manager = new SessionManager({
+    store: new MemorySessionStore(),
+    modelsFor: () => fakeModels([]),
+  });
+  const { session } = await manager.create({ cwd: "/work" });
+  const emit = kernelEmit(session.kernel.ctx);
+  const message = (text: string, usage: Usage = emptyUsage()) =>
+    ({
+      role: "assistant",
+      content: [{ type: "text", text }],
+      api: "fake",
+      provider: "fake",
+      model: "fake-model",
+      usage,
+      stopReason: "stop",
+      timestamp: 0,
+    }) satisfies AssistantMessage;
+  const frame = (at: number, text: string) => {
+    vi.setSystemTime(at);
+    const partial = message(text);
+    emit("message:update", {
+      runId: "r",
+      turnId: "t",
+      message: partial,
+      event: {
+        type: "text_delta",
+        contentIndex: 0,
+        delta: text,
+        partial,
+      } satisfies AssistantMessageEvent,
+    });
+  };
+  const start = () => emit("message:start", { runId: "r", turnId: "t" });
+  start();
+  return {
+    start,
+    frame,
+    end(at: number, text: string, usage: Usage) {
+      vi.setSystemTime(at);
+      emit("message:end", { runId: "r", message: message(text, usage) });
+    },
+    rate: () => session.view.snapshot().sections.rate as GenerationRate | null,
+    async [Symbol.asyncDispose]() {
+      vi.useRealTimers();
+      await manager.closeAll();
+    },
+  };
+}
+
+it("estimates a streaming generation at most once a second, then reports its measured rate", async () => {
+  await using run = await scriptedGeneration();
+  run.frame(0, "a".repeat(4));
+  run.frame(500, "a".repeat(400));
+  expect(run.rate()).toBeNull();
+  // 200 estimated tokens one second after the first output.
+  run.frame(1000, "a".repeat(800));
+  expect(run.rate()).toEqual({ tokensPerSec: 200, basis: "estimate" });
+  run.frame(1999, "a".repeat(1600));
+  expect(run.rate()).toEqual({ tokensPerSec: 200, basis: "estimate" });
+  run.frame(2000, "a".repeat(2000));
+  expect(run.rate()).toEqual({ tokensPerSec: 250, basis: "estimate" });
+  // 300 reported output tokens over the two seconds from first to last output.
+  run.end(2000, "a".repeat(2000), { ...emptyUsage(), output: 300 });
+  expect(run.rate()).toEqual({ tokensPerSec: 150, basis: "measured" });
+});
+
+it("shows no rate when a generation starts until its first estimate", async () => {
+  await using run = await scriptedGeneration();
+  run.frame(0, "a".repeat(4));
+  run.frame(2000, "a".repeat(800));
+  run.end(2000, "a".repeat(800), { ...emptyUsage(), output: 100 });
+  expect(run.rate()).toEqual({ tokensPerSec: 50, basis: "measured" });
+  // The next generation of the turn drops the last one's rate rather than showing it as its own.
+  run.start();
+  expect(run.rate()).toBeNull();
+  run.frame(3000, "a".repeat(4));
+  run.frame(3999, "a".repeat(400));
+  expect(run.rate()).toBeNull();
+  run.frame(4000, "a".repeat(800));
+  expect(run.rate()).toEqual({ tokensPerSec: 200, basis: "estimate" });
+});
+
+it("keeps an ended generation an estimate when the provider reports no output", async () => {
+  await using run = await scriptedGeneration();
+  run.frame(0, "a".repeat(4));
+  run.frame(2000, "a".repeat(800));
+  run.end(2000, "a".repeat(800), emptyUsage());
+  expect(run.rate()).toEqual({ tokensPerSec: 100, basis: "estimate" });
 });
 
 function deferred<T>() {

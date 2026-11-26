@@ -28,13 +28,20 @@ import type { Database } from "bun:sqlite";
 import type { AgentStore } from "../agents/store";
 import type { AttachmentStore } from "../conversations/attachments";
 import type { ConversationStore } from "../conversations/store";
+import type { MachineStore } from "../machines/store";
+import type { ProjectStore } from "../projects/store";
 import type { DraftInput, TaskCards } from "./cards";
 import type { GraphEdge, GraphTask } from "./graph";
 import type { TaskRunStore } from "./runs";
 import type { TaskRecord, TaskStore } from "./store";
 import { TASK_STATUSES } from "@eta/client-contracts";
+import { checkExternalAgentProject } from "../agents/bounds";
 import { viewOf as attachmentView } from "../conversations/attachments";
-import { resolveAssignee } from "./assignee";
+import {
+  assigneeScopeFor,
+  CAPTAIN_ASSIGNEE_ERROR,
+  resolveAssignee,
+} from "./assignee";
 import { nameOf, TaskGraph } from "./graph";
 import { finished, workable } from "./status";
 
@@ -103,6 +110,8 @@ export interface TaskRuns {
   start: (taskId: string) => void;
   /** The task is done or cancelled: its runs stop. */
   stop: (taskId: string, why: string) => void;
+  /** The task is finished, archived or deleted: its worktree, if it has one, can go. */
+  release?: (task: TaskRecord) => void;
   /** Whether a run of the task is starting or going. */
   active: (taskId: string) => boolean;
   /**
@@ -132,6 +141,8 @@ export interface TaskBoardDeps {
   runs: TaskRunStore;
   cards: TaskCards;
   conversations: ConversationStore;
+  projects: ProjectStore;
+  machines: MachineStore;
   /** Who an assignee is: the caller names it, the task keeps the registry's id. */
   agents: Pick<AgentStore, "get" | "list">;
   /** The newest version of each artifact published for a task. */
@@ -328,9 +339,10 @@ export class TaskBoard {
   /* ---------------------------------------------------------------- changes */
 
   /**
-   * An agent makes a task at once (the user asked for one). Users do not make tasks: the one who
-   * makes a task is the one who executes it. A task made this way has no card, since only a
-   * confirmed draft puts one in a timeline, and its first run is queued.
+   * An agent makes a task at once (the user asked for one), executed by `assignee` when named, or
+   * by the maker itself when omitted. Users create tasks through `make` (`tasks.create`), which
+   * requires an explicit `assignee`. A task made here has no card, since only a confirmed draft
+   * puts one in a timeline, and its first run is queued.
    */
   create(
     input: FieldsInput & {
@@ -347,6 +359,15 @@ export class TaskBoard {
       dependsOn?: readonly DependencyInput[] | undefined;
       /** The task it is a subtask of (`#N` or id). */
       parent?: string | undefined;
+      /** Atomic pre-insert hook inside the create transaction (e.g. Captain dispatch provenance). */
+      beforeCreate?:
+        | (() => {
+            captainAssignmentId?: string | null | undefined;
+            captainMessageId?: string | null | undefined;
+          })
+        | undefined;
+      /** Atomic post-insert hook inside the create transaction once the task row has its id and number. */
+      afterCreate?: ((task: TaskRecord) => void) | undefined;
     },
     actor: TaskActor,
   ): BoardTaskDetail {
@@ -355,8 +376,23 @@ export class TaskBoard {
     const { title, ...fields } = this.#fieldsOf(input);
     const { base, assignee } = input;
     if (title === undefined) throw new Error("a task needs a title");
-    const assigneeAgent = resolveAssignee(assignee, this.#deps.agents);
     const conversationId = this.#conversation(input.conversationId)!;
+    const conversation = this.#deps.conversations.get(conversationId);
+    const project =
+      conversation === undefined
+        ? undefined
+        : this.#deps.projects.get(conversation.projectId);
+    const scope = assigneeScopeFor(conversationId, this.#deps.conversations);
+    const assigneeAgent = resolveAssignee(assignee, this.#deps.agents, scope);
+    if (
+      assigneeAgent === undefined &&
+      this.#deps.agents.get(actor.agentId)?.systemRole === "captain"
+    )
+      throw new Error(CAPTAIN_ASSIGNEE_ERROR);
+    const executorId = assigneeAgent ?? actor.agentId;
+    const executor = this.#deps.agents.get(executorId);
+    if (executor !== undefined && project !== undefined)
+      checkExternalAgentProject(executor, project, this.#deps.machines);
     const dependsOn = this.#dependenciesOf(input.dependsOn);
     const parent =
       input.parent === undefined || input.parent.trim() === ""
@@ -367,14 +403,17 @@ export class TaskBoard {
     // dependencies are in place is the thing they are there to prevent.
     let moved: Moved[] = [];
     const task = this.#deps.db.transaction(() => {
+      const provenance = input.beforeCreate?.();
       const made = this.#deps.tasks.create({
         ...fields,
         title,
         conversationId,
         createdByAgent: maker,
         assigneeAgent,
-        captainAssignmentId: input.captainAssignmentId,
-        captainMessageId: input.captainMessageId,
+        captainAssignmentId:
+          provenance?.captainAssignmentId ?? input.captainAssignmentId,
+        captainMessageId:
+          provenance?.captainMessageId ?? input.captainMessageId,
         baseBranch: base === undefined ? undefined : this.#baseOf(base),
         projectId: this.#deps.conversations.get(conversationId)?.projectId,
         workspaceMode: input.workspace,
@@ -384,6 +423,7 @@ export class TaskBoard {
       for (const edge of dependsOn)
         this.#addEdge(made.id, edge.taskId, edge.requireDone, actor);
       if (parent !== undefined) moved = this.#deriveIn(parent.id);
+      input.afterCreate?.(made);
       return made;
     })();
     this.#announce(task.id, "created", []);
@@ -446,14 +486,23 @@ export class TaskBoard {
         "a task needs a project to work in: give it a parent, or a conversation in a project",
       );
     const workspace = input.workspace ?? parent?.workspaceMode ?? "local";
+    const project = this.#deps.projects.get(projectId);
+    const scope = assigneeScopeFor(conversationId, this.#deps.conversations);
     // Everything named is checked before anything is written.
     const planned = input.tasks.map((entry, index) => {
       const { title, description } = this.#fieldsOf(entry);
       if (title === undefined)
         throw new Error(`task ${index + 1} needs a title`);
-      const assigneeAgent = resolveAssignee(entry.assignee, this.#deps.agents);
+      const assigneeAgent = resolveAssignee(
+        entry.assignee,
+        this.#deps.agents,
+        scope,
+      );
       if (assigneeAgent === undefined)
         throw new Error(`task ${index + 1} needs an executor`);
+      const executor = this.#deps.agents.get(assigneeAgent);
+      if (executor !== undefined && project !== undefined)
+        checkExternalAgentProject(executor, project, this.#deps.machines);
       for (const at of [
         ...(entry.after ?? []),
         ...(entry.under === undefined ? [] : [entry.under]),
@@ -577,9 +626,10 @@ export class TaskBoard {
     if (after.status !== before.status) {
       // Done or cancelled work is not worked on any more. Out of the backlog, a task that never
       // ran starts; one that has run already is rerun by hand.
-      if (after.status === "done" || after.status === "cancelled")
+      if (after.status === "done" || after.status === "cancelled") {
         this.#runs?.stop(id, `The task is ${after.status}.`);
-      else if (
+        this.#runs?.release?.(after);
+      } else if (
         workable(after.status) &&
         !workable(before.status) &&
         this.#deps.runs.ofTask(id).length === 0 &&
@@ -824,6 +874,7 @@ export class TaskBoard {
     for (const other of awaited) this.#announce(other, "changed", []);
     this.#graphChanged();
     void this.#deps.attachments?.dropTask(id).catch(() => undefined);
+    this.#runs?.release?.(task);
   }
 
   /**
@@ -911,6 +962,7 @@ export class TaskBoard {
           });
         });
     })();
+    for (const t of tree) this.#runs?.release?.(this.#existing(t.id));
     return this.#detailOf(this.#existing(task.id));
   }
 
@@ -1018,6 +1070,7 @@ export class TaskBoard {
         });
       }
     })();
+    for (const task of chosen) this.#runs?.release?.(task);
     return chosen.map((task) => task.id);
   }
 
@@ -1529,7 +1582,23 @@ export class TaskBoard {
    * thread. One from Captain's own conversation, or from nowhere, can call in any agent.
    */
   #checkMentions(task: TaskRecord, mentions: readonly string[]): void {
-    if (mentions.length === 0 || task.originConversationId === null) return;
+    if (mentions.length === 0) return;
+    const project =
+      task.projectId === null
+        ? undefined
+        : this.#deps.projects.get(task.projectId);
+    if (project !== undefined) {
+      for (const agentId of mentions) {
+        const mentionedAgent = this.#deps.agents.get(agentId);
+        if (mentionedAgent !== undefined)
+          checkExternalAgentProject(
+            mentionedAgent,
+            project,
+            this.#deps.machines,
+          );
+      }
+    }
+    if (task.originConversationId === null) return;
     const origin = this.#deps.conversations.get(task.originConversationId);
     if (origin?.kind !== "group") return;
     const members = new Set(

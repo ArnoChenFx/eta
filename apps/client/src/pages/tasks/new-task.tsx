@@ -17,6 +17,7 @@ import {
 import { sendShortcut } from "../../components/eta-editor";
 import { control, space } from "../../components/tokens";
 import { uiText } from "../../i18n";
+import { agentAllowedOnMachine } from "../../services/agent-machine";
 import { useHost } from "../../services/host";
 import { createDescription, DescriptionBox } from "./description-box";
 import { Segmented } from "./segmented";
@@ -41,11 +42,43 @@ export function NewTask(props: {
   const waitsFor = signal<string[]>([]);
   const start = signal<"ready" | "backlog">("ready");
   const busy = signal(false);
-  const executor = () => agent() || host.people()[0]?.id || "";
   const groups = () =>
     host
       .conversations()
       .filter((item) => item.kind === "group" && !item.archived);
+  const selectedParent = () =>
+    parent() ? host.tasks().find((task) => task.id === parent()) : undefined;
+  const effectiveGroup = () => {
+    const chosenId = conversation() || selectedParent()?.conversationId;
+    return chosenId
+      ? groups().find((entry) => entry.id === chosenId)
+      : undefined;
+  };
+  const projectMachineId = () => {
+    const projectId = effectiveGroup()?.projectId;
+    if (!projectId) return undefined;
+    const project = host.projects().find((entry) => entry.id === projectId);
+    return project && project.kind !== "agent_home"
+      ? project.machineId
+      : undefined;
+  };
+  const eligiblePeople = () => {
+    const group = effectiveGroup();
+    const machineId = projectMachineId();
+    const allowed = host
+      .people()
+      .filter((entry) => agentAllowedOnMachine(entry, machineId));
+    if (group === undefined) return allowed;
+    const members = new Set(group.participants.map((member) => member.agentId));
+    return allowed.filter((entry) => members.has(entry.id));
+  };
+  const executor = () => {
+    const candidates = eligiblePeople();
+    const picked = agent();
+    if (picked && candidates.some((entry) => entry.id === picked))
+      return picked;
+    return candidates[0]?.id || "";
+  };
   const tasks = () =>
     host.tasks().filter((task) => task.status !== "cancelled");
   const titleOf = (id: string) =>
@@ -135,10 +168,10 @@ export function NewTask(props: {
               truncateValue
               triggerStyle={select}
               empty={
-                host.people().length ? undefined : uiText("noAgentsToPick")
+                eligiblePeople().length ? undefined : uiText("noAgentsToPick")
               }
             >
-              <Each of={host.people()} key={(entry) => entry.id}>
+              <Each of={eligiblePeople()} key={(entry) => entry.id}>
                 {(entry) => (
                   <ActionItem
                     label={entry().name}

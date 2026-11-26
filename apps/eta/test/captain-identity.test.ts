@@ -6,6 +6,7 @@
  */
 import { readdir } from "node:fs/promises";
 import { join } from "node:path";
+import { DEFAULT_SYSTEM_PROMPT } from "@eta/harness";
 import { Database } from "bun:sqlite";
 import { describe, expect, it } from "vitest";
 import { AgentStore } from "../src/agents/store";
@@ -104,8 +105,13 @@ describe("the first start of Captain", () => {
       expect(resolveNamed([name], members, "someone-else").ids).toEqual([
         captain,
       ]);
-      expect(resolveAssignee(name.replace(/^@/, ""), agents)).toBe(captain);
+      expect(() => resolveAssignee(name.replace(/^@/, ""), agents)).toThrow(
+        /Captain cannot be assigned/,
+      );
     }
+    expect(() => resolveAssignee(captain, agents)).toThrow(
+      /Captain cannot be assigned/,
+    );
     // The user agent is still reachable by its id.
     expect(resolveNamed(["user-captain"], members, "x").ids).toEqual([
       "user-captain",
@@ -126,5 +132,47 @@ describe("the first start of Captain", () => {
         "SELECT COUNT(*) AS n FROM agent WHERE system_role = 'captain'",
       ),
     ).toBe(1);
+  });
+});
+
+describe("the base prompt after an upgrade", () => {
+  const latest = (db: Database) =>
+    db
+      .query<{ version: number; content: string }, []>(
+        "SELECT version, content FROM captain_prompt_version WHERE subject_id = 'global' AND kind = 'base' ORDER BY version DESC LIMIT 1",
+      )
+      .get()!;
+
+  it("follows a newer default when nobody edited the old one", async () => {
+    const dataDir = await tempDir();
+    const first = await testHost({ dataDir, captain: true });
+    await first.close();
+    const db = new Database(databasePath(dataDir));
+    db.run(
+      "UPDATE captain_prompt_version SET content = 'an older default' WHERE subject_id = 'global' AND kind = 'base'",
+    );
+    db.close();
+
+    const host = await testHost({ dataDir, captain: true });
+    expect(latest(host.db)).toEqual({
+      version: 2,
+      content: DEFAULT_SYSTEM_PROMPT,
+    });
+    expect(host.product.captain.basePrompt()).toBe(DEFAULT_SYSTEM_PROMPT);
+  });
+
+  it("leaves a base prompt a person set", async () => {
+    const dataDir = await tempDir();
+    const first = await testHost({ dataDir, captain: true });
+    await first.close();
+    const db = new Database(databasePath(dataDir));
+    db.run(
+      "INSERT INTO captain_prompt_version (id, subject_id, kind, version, content, actor_agent, created_at) VALUES ('mine', 'global', 'base', 2, 'my own words', NULL, 1)",
+    );
+    db.close();
+
+    const host = await testHost({ dataDir, captain: true });
+    expect(latest(host.db)).toEqual({ version: 2, content: "my own words" });
+    expect(host.product.captain.basePrompt()).toBe("my own words");
   });
 });

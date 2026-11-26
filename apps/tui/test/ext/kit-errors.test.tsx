@@ -1,40 +1,18 @@
 /**
  * What a failed call tells the user: the wire's own failures in both languages, the gateway's
- * codes in the words the web page uses, the host's message for everything else, and one real
- * failure from a real host.
+ * codes in the user's language with their values filled in, the host's message for everything
+ * else, and one real failure from a real host.
+ *
+ * Reference is the kit's own `llmProblemMessages` rather than `apps/web/src/locales`, which
+ * #1003 deleted along with `apps/web`. Exhaustive coverage (every `LlmCode` has a message) is
+ * enforced at the type level by `MessageCatalog<LlmCode>` in `errors.ts`; this test guards
+ * placeholder interpolation (`{provider}`, `{status}`) and non-fallback to the raw diagnostic.
  */
-import type { LlmCode } from "@eta/client-contracts";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import { LLM_CODES } from "@eta/client-contracts";
 import { describe, expect, it } from "vitest";
 import { WireError } from "../../src/connection/wire";
 import { callErrorText } from "../../src/ext/kit/errors";
-
-const webLocales = resolve(import.meta.dirname, "../../../web/src/locales");
-
-function webProblems(locale: "en" | "zh"): Record<string, string> {
-  const file = JSON.parse(
-    readFileSync(resolve(webLocales, locale, "llm.json"), "utf8"),
-  ) as { problems: Record<string, string> };
-  return file.problems;
-}
-
-/** The web's key for a code (`login_expired` is `loginExpired`), and its `{{x}}` as `{x}`. */
-function webText(
-  locale: "en" | "zh",
-  code: LlmCode,
-  params: { provider: string; status: string },
-): string {
-  const key = code.replace(/_(\w)/g, (_, c: string) => c.toUpperCase());
-  const template = webProblems(locale)[key];
-  if (template === undefined)
-    throw new Error(`the web has no text for ${code}`);
-  return template.replace(
-    /\{\{(\w+)\}\}/g,
-    (_, name: "provider" | "status") => params[name],
-  );
-}
+import { llmProblemMessages } from "../../src/ext/kit/messages";
 
 describe("callErrorText for the wire's own failures", () => {
   it.each([
@@ -66,16 +44,17 @@ describe("callErrorText for the host's failures", () => {
           ["zh", code],
         ] as const,
     ),
-  )("%s %s reads as the web page reads it", (locale, code) => {
+  )("%s %s is the code in the user's language", (locale, code) => {
     const error = new WireError("server", "diagnostic", {
       code,
       params: { provider: "Grok", status: 429 },
     });
     const text = callErrorText(error, locale);
-    expect(text).toBe(
-      webText(locale, code, { provider: "Grok", status: "429" }),
-    );
+    const template = llmProblemMessages[locale][code];
+    expect(text).not.toBe("");
     expect(text).not.toMatch(/[{}]/);
     expect(text).not.toBe("diagnostic");
+    if (template.includes("{provider}")) expect(text).toContain("Grok");
+    if (template.includes("{status}")) expect(text).toContain("429");
   });
 });

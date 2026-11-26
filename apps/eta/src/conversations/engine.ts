@@ -6,7 +6,7 @@ import type {
   SteerHeldResult,
 } from "@eta/client-contracts";
 import type { KernelModels, KernelTool } from "@eta/core";
-import type { AskObserver } from "@eta/harness";
+import type { AskObserver, ImageLimits } from "@eta/harness";
 import type { ManagedSession, SessionMeta, SessionsService } from "@eta/server";
 import type { SshTransport } from "@eta/ssh";
 /**
@@ -38,10 +38,13 @@ import type { ConversationPolicies } from "./policy";
 import type { ConversationRecord, ConversationStore } from "./store";
 import type { Timeline } from "./timeline";
 import { homedir } from "node:os";
+import { isExternalRuntime } from "@eta/client-contracts";
 import { heldFor } from "@eta/client-contracts/routing";
 import { kernelOn } from "@eta/core";
 import { lastSeq, LinkError, listen } from "@eta/daemon";
+import { imageLimitsFor } from "@eta/harness";
 import { parseModelId } from "@eta/server";
+import { externalAgentProjectError } from "../agents/bounds";
 import { explainRunError, missingModel } from "../agents/model";
 import { heldIn } from "../session-owner";
 import { viewOf as attachmentView } from "./attachments";
@@ -282,13 +285,19 @@ export class Engine {
   }
 
   /**
-   * The machine an agent's sessions in a project are made on: its own, when it is pinned to one
-   * that is still here, else the project's.
+   * The machine an agent's sessions in a project are made on: external runtimes use only their
+   * pinned machine and never fall back to the project's; built-in `"eta"` agents use their pinned
+   * machine when set, else the project's.
    */
   machineFor(
     agent: AgentRecord,
     projectMachineId: string,
   ): MachineRecord | undefined {
+    if (isExternalRuntime(agent.runtime)) {
+      return agent.machineId === null
+        ? undefined
+        : this.#machines.get(agent.machineId);
+    }
     const pinned =
       agent.machineId === null
         ? undefined
@@ -499,6 +508,14 @@ export class Engine {
     /** The machine the task's project is on, when the session is made on another one. */
     awayFrom?: MachineRecord | undefined;
   }): Promise<SessionHandle> {
+    if (
+      isExternalRuntime(input.agent.runtime) &&
+      (input.agent.machineId === null ||
+        input.machine.id !== input.agent.machineId)
+    )
+      throw new Error(
+        `${input.agent.name} runs on ${input.agent.runtime} and may only run on its pinned machine`,
+      );
     const unset = missingModel(input.agent);
     if (unset !== undefined) throw new Error(unset);
     const place = this.#placeOf(input.machine);
@@ -1055,7 +1072,11 @@ export class Engine {
     ref: string,
   ): Promise<{ mime: string; dataBase64: string }> {
     const running = this.#running.get(keyOf(conversationId, agentId));
-    if (running === undefined || !(await this.#takesImages(running.handle)))
+    const limits =
+      running === undefined
+        ? undefined
+        : await this.#imageLimits(running.handle);
+    if (limits === undefined)
       throw new Error("The model you run on does not support images.");
     const id = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}/i.exec(
       ref.split(/[\\/]/).pop()!,
@@ -1063,7 +1084,7 @@ export class Engine {
     const record = id === undefined ? undefined : this.#attachments.get(id);
     if (record === undefined || record.conversationId !== conversationId)
       throw new Error(`No such attachment in this conversation: ${ref}`);
-    return await this.#attachments.image(record);
+    return await this.#attachments.image(record, limits);
   }
 
   /** The room an agent is in, as the `conversation_info` tool tells it. */
@@ -1091,6 +1112,30 @@ export class Engine {
       `Members: ${members.join(", ")}`,
       ...described.lines,
     ].join("\n");
+  }
+
+  /* ------------------------------------------------------------- context */
+
+  /**
+   * Start every member's context over. After many compactions a session's context decays, and
+   * the way out is a new session. Refused while a reply is in flight: the run holds its session.
+   * What the members are told next is only what is said after this; the conversation's goal and
+   * decisions still reach them through `conversation_info`.
+   */
+  resetContext(conversationId: string): number {
+    this.#requireConversation(conversationId);
+    if (
+      this.#timeline.active(conversationId).length > 0 ||
+      [...this.#running.keys()].some((key) =>
+        key.startsWith(`${conversationId}:`),
+      )
+    )
+      throw new Error(
+        "a reply is still running here; stop it before clearing the context",
+      );
+    const released = this.#conversations.clearSessions(conversationId);
+    this.#changed([conversationId]);
+    return released.length;
   }
 
   /* ---------------------------------------------------------------- stop */
@@ -1390,10 +1435,21 @@ export class Engine {
       project === undefined ? undefined : this.#machines.get(project.machineId);
     if (project === undefined || home === undefined)
       return fail("unavailable", "The conversation's project is gone.");
+    const boundProblem = externalAgentProjectError(
+      agent,
+      project,
+      this.#machines,
+    );
+    if (boundProblem !== undefined) return fail("unavailable", boundProblem);
     // An agent pinned to a machine answers from there, wherever the project is: in its home
     // directory, told (out of the transcript's sight) that the project's paths are another
     // machine's.
-    const machine = this.machineFor(agent, project.machineId) ?? home;
+    const machine = this.machineFor(agent, project.machineId);
+    if (machine === undefined)
+      return fail(
+        "unavailable",
+        `${agent.name}'s machine (${agent.machineId ?? "unassigned"}) is not registered.`,
+      );
     const elsewhere = machine.id !== home.id;
     const cwd = elsewhere ? homeOf(machine) : project.path;
     const away = elsewhere
@@ -1669,29 +1725,37 @@ export class Engine {
     const lines = new Map<string, string>();
     if (files.length === 0) return { lines, images: [], unseen: false };
     const placed = await this.#place(files, machine);
-    const sees = await this.#takesImages(handle);
+    const limits = await this.#imageLimits(handle);
+    const prepared =
+      limits === undefined
+        ? { images: [], omitted: new Map<string, string>() }
+        : await this.#attachments.images(
+            files.filter((file) => placed.paths.has(file.id)),
+            limits,
+          );
     let unseen = false;
     for (const file of files) {
       const path = placed.paths.get(file.id);
       const image = file.contentType.startsWith("image/");
-      if (image && !sees) unseen = true;
+      const note =
+        path === undefined
+          ? undefined
+          : !image
+            ? undefined
+            : limits === undefined
+              ? "the model you run on does not support images"
+              : prepared.omitted.get(file.id);
+      if (note !== undefined) unseen = true;
       lines.set(
         file.id,
         path === undefined
           ? `[attachment ${file.name} could not be put where you can read it: ${placed.failed.get(file.id) ?? "unknown error"}]`
           : `[attachment: ${path} (${file.contentType}, ${file.size} bytes)${
-              image && !sees
-                ? "; not shown: the model you run on does not support images"
-                : ""
+              note === undefined ? "" : `; not shown: ${note}`
             }]`,
       );
     }
-    const images = sees
-      ? await this.#attachments.images(
-          files.filter((file) => placed.paths.has(file.id)),
-        )
-      : [];
-    return { lines, images, unseen };
+    return { lines, images: prepared.images, unseen };
   }
 
   /** Put the files where the conversation's sessions can open them; a machine out of reach fails them all. */
@@ -1715,16 +1779,17 @@ export class Engine {
     return this.#shell(machine);
   }
 
-  /** Whether the session's model accepts images; when that cannot be told, no images are sent. */
-  async #takesImages(handle: SessionHandle): Promise<boolean> {
+  /** The image limits of the session's model, or undefined when it does not accept images. */
+  async #imageLimits(handle: SessionHandle): Promise<ImageLimits | undefined> {
     try {
       const id = await handle.model();
-      if (id === undefined) return false;
+      if (id === undefined) return undefined;
       const { provider, modelId } = parseModelId(id);
       const model = this.#models?.()?.getModel(provider, modelId);
-      return model?.input?.includes("image") === true;
+      if (model?.input?.includes("image") !== true) return undefined;
+      return imageLimitsFor({ provider, modelId });
     } catch {
-      return false;
+      return undefined;
     }
   }
 

@@ -16,9 +16,11 @@ import type {
   ToolActivity,
 } from "@eta/client-contracts";
 import type { World } from "./support/world";
+import { spawn } from "node:child_process";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { createRuntimeRegistry } from "@botiverse/oar";
+import process from "node:process";
+import { antigravityRuntime, createRuntimeRegistry } from "@botiverse/oar";
 import { scriptedRuntime } from "@botiverse/oar/testing";
 import { createOarRuntimes } from "@eta/runtime-oar";
 import { describe, expect, it } from "vitest";
@@ -123,6 +125,11 @@ describe("an agent's runtime", () => {
     const { agent: moved } = (await w.client.call("agents", "update", {
       agentId: agent.id,
       runtime: "claude",
+      machineId: w.host.db
+        .query<{ id: string }, []>(
+          "SELECT id FROM machine WHERE kind = 'primary'",
+        )
+        .get()!.id,
     })) as { agent: AgentView };
     expect(moved).toMatchObject({ runtime: "claude", model: null });
   });
@@ -132,22 +139,22 @@ describe("an agent's runtime", () => {
     const { runtimes } = (await w.client.call("agents", "runtimes", {})) as {
       runtimes: AgentRuntimeInfo[];
     };
-    const registered = runtimes.filter((runtime) => !runtime.discovered);
-    expect(registered.map((runtime) => runtime.id)).toEqual([
+    expect(runtimes.map((runtime) => runtime.id)).toEqual([
       "claude",
       "codex",
       "opencode",
       "pi",
+      "antigravity",
       "grok",
       "qwen",
     ]);
     // The scripted one is there; the others are not in this registry at all.
-    expect(registered[0]).toMatchObject({
+    expect(runtimes[0]).toMatchObject({
       label: "Claude Code",
       status: "available",
     });
     expect(
-      registered.slice(1).every((runtime) => runtime.status === "error"),
+      runtimes.slice(1).every((runtime) => runtime.status === "error"),
     ).toBe(true);
   });
 });
@@ -313,6 +320,11 @@ describe("a conversation with an agent on Claude Code", () => {
     await w.client.call("agents", "update", {
       agentId: agent.id,
       runtime: "claude",
+      machineId: w.host.db
+        .query<{ id: string }, []>(
+          "SELECT id FROM machine WHERE kind = 'primary'",
+        )
+        .get()!.id,
     });
     const done = await w.settled(
       chat,
@@ -490,6 +502,140 @@ describe("eta's tools, called by an agent on Claude Code", () => {
   });
 });
 
+describe("eta's tools, called by an agent on Antigravity through the stdio MCP bridge", () => {
+  it("executes host tools cleanly over stdio + SessionOptions.env and strips toolSummary", async () => {
+    const scripted = scriptedRuntime({
+      id: "antigravity",
+      turn: async (turn) => {
+        const server = turn.options.mcpServers?.find(
+          (entry) => entry.name === "eta",
+        );
+        if (server === undefined || "type" in server)
+          throw new Error("expected stdio MCP bridge for eta");
+        const args = {
+          path: "site",
+          title: "Bridge Page",
+          toolSummary: "Publish Bridge Page",
+        };
+        await turn.tool(
+          "mcp_eta_publish_artifact",
+          JSON.stringify(args),
+          async () => {
+            const childEnv: Record<string, string | undefined> = {
+              ...process.env,
+            };
+            for (const [key, value] of Object.entries(turn.options.env ?? {})) {
+              if (value === null) delete childEnv[key];
+              else if (value !== undefined) childEnv[key] = value;
+            }
+            const child = spawn(server.command, [...(server.args ?? [])], {
+              env: childEnv,
+              stdio: ["pipe", "pipe", "pipe"],
+            });
+            const lines: Record<string, unknown>[] = [];
+            const waiters: ((msg: Record<string, unknown>) => void)[] = [];
+            const decoder = new TextDecoder();
+            let buffer = "";
+            child.stdout.on("data", (chunk: Uint8Array) => {
+              buffer += decoder.decode(chunk, { stream: true });
+              for (
+                let nl = buffer.indexOf("\n");
+                nl >= 0;
+                nl = buffer.indexOf("\n")
+              ) {
+                const line = buffer.slice(0, nl).trim();
+                buffer = buffer.slice(nl + 1);
+                if (line === "") continue;
+                const parsed = JSON.parse(line) as Record<string, unknown>;
+                const waiter = waiters.shift();
+                if (waiter !== undefined) waiter(parsed);
+                else lines.push(parsed);
+              }
+            });
+            const next = async () =>
+              lines.shift() ??
+              (await new Promise<Record<string, unknown>>((resolve) =>
+                waiters.push(resolve),
+              ));
+            child.stdin.write(
+              `${JSON.stringify({
+                jsonrpc: "2.0",
+                id: 1,
+                method: "initialize",
+                params: {
+                  protocolVersion: "2025-06-18",
+                  capabilities: {},
+                  clientInfo: { name: "agy", version: "1.5.16" },
+                },
+              })}\n`,
+            );
+            await next();
+            child.stdin.write(
+              `${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`,
+            );
+            child.stdin.write(
+              `${JSON.stringify({
+                jsonrpc: "2.0",
+                id: 2,
+                method: "tools/call",
+                params: { name: "publish_artifact", arguments: args },
+              })}\n`,
+            );
+            const reply = (await next()) as {
+              result: { content: { text: string }[] };
+            };
+            child.stdin.end();
+            await new Promise((resolve) => child.once("exit", resolve));
+            return reply.result.content.map((part) => part.text).join("");
+          },
+        );
+        turn.say("published via bridge");
+      },
+    });
+    const w = await world({
+      runtimes: createOarRuntimes({
+        registry: createRuntimeRegistry([
+          {
+            ...scripted,
+            refusedSessionOptions: antigravityRuntime.refusedSessionOptions,
+            manualCompaction: antigravityRuntime.manualCompaction,
+          },
+        ]),
+      }),
+    });
+    const agent = await w.agent("Agy", { runtime: "antigravity" });
+    const project = await w.project();
+    await mkdir(join(project.path, "site"), { recursive: true });
+    await writeFile(join(project.path, "site", "index.html"), "<h1>agy</h1>");
+    const group = await w.group(project.id, [agent.id]);
+    await w.watch(group.id);
+    w.client.subscribe("artifacts");
+    const sent = await w.send(group.id, "publish the site", {
+      mentions: [agent.id],
+    });
+    const done = await w.settled(group.id, sent.replies[0]!.id);
+    expect(done.status).toBe("done");
+    expect(done.text).toBe("published via bridge");
+
+    const artifacts = () =>
+      w.client.section<ArtifactView[]>("artifacts", "list") ?? [];
+    await until(() => artifacts().length === 1);
+    const activity = (done.data as { activity: ToolActivity[] }).activity;
+    expect(activity).toHaveLength(1);
+    expect(activity[0]).toMatchObject({
+      name: "publish_artifact",
+      input: { path: "site", title: "Bridge Page" },
+      status: "completed",
+      details: {
+        artifactId: artifacts()[0]!.id,
+        title: "Bridge Page",
+        version: 1,
+        files: 1,
+      },
+    });
+  });
+});
+
 describe("eta's tools, on eta and on Claude Code", () => {
   /** What eta's model is given of a tool, as JSON: what reaches a provider. */
   interface Definition {
@@ -638,7 +784,10 @@ describe("/compact on an agent on a runtime", () => {
       return { kind: "completed" } as CompactionOutcome;
     });
     const r = await remoteWorld({}, { node: { runtimes } });
-    const cody = await r.agent("Cody", { runtime: "claude" });
+    const cody = await r.agent("Cody", {
+      runtime: "claude",
+      machineId: r.daemon.machineId,
+    });
     const group = await r.group(r.remoteProject.id, [cody.id]);
     await r.watch(group.id);
     const sent = await r.send(group.id, "hi");

@@ -1,7 +1,8 @@
 import { existsSync, readdirSync } from "node:fs";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { kernelOn } from "@eta/core";
 import { MemoryStorage } from "@eta/core/storage";
 import { assistantMessage, fakeModels } from "@eta/core/testing";
 import { Type } from "typebox";
@@ -116,9 +117,11 @@ describe("esmrun", () => {
     expect(text).toContain('"seen": "1: hi"');
     expect(text).toContain(cwd.split("/").at(-1)!);
     expect(existsSync(join(cwd, "hello.txt"))).toBe(true);
-    expect(readdirSync(join(root, "runs")).some((f) => f.endsWith(".js"))).toBe(
-      true,
-    );
+    // The history holds the code; a run leaves no script file behind.
+    expect(
+      existsSync(join(root, "runs")) &&
+        readdirSync(join(root, "runs")).some((f) => f.endsWith(".js")),
+    ).toBe(false);
     expect(
       await session.kernel.tools.execute(
         "read_state",
@@ -384,6 +387,399 @@ describe("realm cwd", () => {
     session.kernel.nextRun(userMsg("go"));
     await session.runner.run();
     expect(resultOf(session, "c-esmrun")).toContain("a.txt");
+    session.stop();
+  });
+});
+
+describe("cancelling the realm", () => {
+  /** Polls until `check` holds; the realm's first wake is not instant. */
+  const until = async (check: () => boolean, ms: number): Promise<boolean> => {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+      if (check()) return true;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    return check();
+  };
+
+  /** A script that says it started, then parks on an await that never settles. */
+  const parked = (marker: string) =>
+    [
+      'import { writeFile } from "node:fs/promises";',
+      `await writeFile("${marker}", "");`,
+      "await new Promise(() => undefined);",
+      '"never"',
+    ].join("\n");
+
+  it("ends a run whose tool call is a script that never settles", async () => {
+    const { session, cwd } = await open([
+      call("esmrun", { script: parked("parked.txt") }),
+      stop(),
+    ]);
+    session.kernel.nextRun(userMsg("go"));
+    const run = session.runner.run();
+    // Aborting before the script is parked would prove nothing: it has to be
+    // sitting on the await when the cancellation arrives.
+    expect(await until(() => existsSync(join(cwd, "parked.txt")), 5000)).toBe(
+      true,
+    );
+    const started = Date.now();
+    session.runner.abort();
+    const status = await Promise.race([
+      run.then((result) => result.status),
+      new Promise<string>((resolve) =>
+        setTimeout(resolve, 1500, "still running"),
+      ),
+    ]);
+    expect(status).toBe("aborted");
+    expect(Date.now() - started).toBeLessThan(1500);
+    expect(session.runner.running).toBe(false);
+    session.stop();
+  });
+
+  it("ends an evaluation whose script is parked when its signal aborts", async () => {
+    const { session, cwd } = await open([]);
+    const controller = new AbortController();
+    const running = session.kernel.tools.execute(
+      "esmrun",
+      { script: parked("signal.txt") },
+      { turn: 1, toolCallId: "c-parked", signal: controller.signal },
+    );
+    expect(await until(() => existsSync(join(cwd, "signal.txt")), 5000)).toBe(
+      true,
+    );
+    controller.abort(new DOMException("cancelled by the test", "AbortError"));
+    const outcome = await Promise.race([
+      running.then(
+        () => "returned",
+        (error: unknown) => `threw: ${String(error)}`,
+      ),
+      new Promise<string>((resolve) =>
+        setTimeout(resolve, 1500, "still running"),
+      ),
+    ]);
+    expect(outcome).toBe("threw: AbortError: cancelled by the test");
+    session.stop();
+  });
+
+  it("preserves completed and in-flight effects on abort without bleeding late completions into the next evaluation", async () => {
+    let slowStarted!: () => void;
+    const onSlowStarted = new Promise<void>((resolve) => {
+      slowStarted = resolve;
+    });
+    let releaseSlow!: () => void;
+    const slowGate = new Promise<void>((resolve) => {
+      releaseSlow = resolve;
+    });
+
+    const slowTool = defineTool({
+      name: "slow_gate",
+      description: "Waits until released.",
+      parameters: Type.Object({}),
+      execute: async () => {
+        slowStarted();
+        await slowGate;
+        return { content: [{ type: "text", text: "slow:done" }] };
+      },
+    });
+
+    const root = await mkdtemp(join(tmpdir(), "esm-abort-root-"));
+    const cwd = await mkdtemp(join(tmpdir(), "esm-abort-cwd-"));
+    const session = await openSession({
+      storage: new MemoryStorage(),
+      models: fakeModels([
+        call(
+          "esmrun",
+          {
+            script: [
+              'import eta from "eta";',
+              'import { writeFile } from "node:fs/promises";',
+              'await writeFile("done.txt", "ok");',
+              'console.log("before-slow");',
+              "await eta.platform.slow_gate({});",
+              'await writeFile("after.txt", "late");',
+            ].join("\n"),
+          },
+          "c-abort-effects",
+        ),
+        call(
+          "esmrun",
+          {
+            script: [
+              'import { writeFile } from "node:fs/promises";',
+              'await writeFile("next.txt", "clean");',
+              '"turn2"',
+            ].join("\n"),
+          },
+          "c-next",
+        ),
+        stop("recovered"),
+      ]) as never,
+      cwd,
+      esm: { root },
+      tools: [slowTool as never],
+    });
+
+    const toolEnds: {
+      toolCallId: string;
+      result: unknown;
+      isError: boolean;
+    }[] = [];
+    const unsub = kernelOn(session.kernel.ctx)("tool:end", (event) => {
+      toolEnds.push({
+        toolCallId: event.toolCallId,
+        result: event.result,
+        isError: event.isError,
+      });
+    });
+
+    session.kernel.nextRun(userMsg("go"));
+    const run1 = session.runner.run();
+    await onSlowStarted;
+    session.runner.abort();
+    const res1 = await run1;
+    expect(res1.status).toBe("aborted");
+    expect(session.runner.running).toBe(false);
+
+    const abortedEnd = toolEnds.find(
+      (entry) => entry.toolCallId === "c-abort-effects",
+    );
+    expect(abortedEnd?.isError).toBe(true);
+    const transcriptEntry = session.runner
+      .getTranscript()
+      .find(
+        (m) => m.role === "toolResult" && m.toolCallId === "c-abort-effects",
+      ) as
+      | {
+          isError?: boolean;
+          content: { type: string; text?: string }[];
+          details?: {
+            aborted?: boolean;
+            file?: string;
+            effects?: { name: string; status: string }[];
+          };
+        }
+      | undefined;
+
+    expect(transcriptEntry?.isError).toBe(true);
+    const text = transcriptEntry?.content[0]?.text ?? "";
+    expect(text).toContain("Tool execution was cancelled before completion.");
+    expect(text).toContain("fs.writeFile done.txt");
+    expect(text).toContain("[aborted] eta.platform.slow_gate");
+    expect(text).toContain("console:\nbefore-slow");
+    expect(text).toContain("script:");
+    expect(transcriptEntry?.details?.aborted).toBe(true);
+    expect(transcriptEntry?.details?.effects).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "fs.writeFile", status: "ok" }),
+        expect.objectContaining({
+          name: "eta.platform.slow_gate",
+          status: "aborted",
+        }),
+      ]),
+    );
+    expect(abortedEnd?.result).toMatchObject({
+      isError: true,
+      details: { aborted: true },
+    });
+
+    // Release the late promise and confirm its completion does not bleed into the next evaluation.
+    releaseSlow();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    session.kernel.nextRun(userMsg("next"));
+    const res2 = await session.runner.run();
+    expect(res2.status).toBe("completed");
+    expect(resultOf(session, "c-next")).toContain("turn2");
+    const nextEntry = session.runner
+      .getTranscript()
+      .find((m) => m.role === "toolResult" && m.toolCallId === "c-next") as
+      | { details?: { effects?: { name: string; detail: string }[] } }
+      | undefined;
+    expect(nextEntry?.details?.effects).toHaveLength(1);
+    expect(nextEntry?.details?.effects?.[0]?.detail).toContain("next.txt");
+
+    unsub();
+    session.stop();
+  });
+
+  it("kills real shell child and grandchild processes on abort and records $ as aborted", async () => {
+    if (process.platform === "win32") return;
+    const { session, cwd } = await open([
+      call(
+        "esmrun",
+        {
+          script:
+            "await $`sh -c 'echo $$ > shell.pid; sleep 30 & echo $! > grand.pid; wait'`;",
+        },
+        "c-shell-abort",
+      ),
+      stop(),
+    ]);
+    session.kernel.nextRun(userMsg("go"));
+    const run = session.runner.run();
+
+    expect(
+      await until(
+        () =>
+          existsSync(join(cwd, "shell.pid")) &&
+          existsSync(join(cwd, "grand.pid")),
+        5000,
+      ),
+    ).toBe(true);
+    const shellPid = Number(
+      (await readFile(join(cwd, "shell.pid"), "utf8")).trim(),
+    );
+    const grandPid = Number(
+      (await readFile(join(cwd, "grand.pid"), "utf8")).trim(),
+    );
+
+    const started = Date.now();
+    session.runner.abort();
+    const res = await run;
+    expect(res.status).toBe("aborted");
+    expect(Date.now() - started).toBeLessThan(1500);
+
+    const isDead = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return false;
+      } catch (error) {
+        return (error as NodeJS.ErrnoException).code === "ESRCH";
+      }
+    };
+    expect(await until(() => isDead(shellPid) && isDead(grandPid), 2000)).toBe(
+      true,
+    );
+
+    const entry = session.runner
+      .getTranscript()
+      .find(
+        (m) => m.role === "toolResult" && m.toolCallId === "c-shell-abort",
+      ) as
+      | { details?: { effects?: { name: string; status: string }[] } }
+      | undefined;
+    expect(entry?.details?.effects).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "$", status: "aborted" }),
+      ]),
+    );
+    session.stop();
+  });
+
+  it("keeps a background $ saved on eta.state alive across normal turns and kills it on session.stop()", async () => {
+    if (process.platform === "win32") return;
+    const { session } = await open([
+      call(
+        "esmrun",
+        {
+          script:
+            'import eta from "eta";\nconst p = $`sleep 30`;\neta.state.srv = p;\np.pid',
+        },
+        "c-bg-start",
+      ),
+      stop("started"),
+      call("esmrun", { script: '"still-here"' }, "c-bg-check"),
+      stop("checked"),
+    ]);
+
+    session.kernel.nextRun(userMsg("start"));
+    const r1 = await session.runner.run();
+    expect(r1.status).toBe("completed");
+    const pid = Number(resultOf(session, "c-bg-start").split("\n")[0]?.trim());
+    expect(Number.isInteger(pid) && pid > 0).toBe(true);
+    expect(() => process.kill(pid, 0)).not.toThrow();
+
+    session.kernel.nextRun(userMsg("next"));
+    const r2 = await session.runner.run();
+    expect(r2.status).toBe("completed");
+    expect(resultOf(session, "c-bg-check")).toContain("still-here");
+    expect(() => process.kill(pid, 0)).not.toThrow();
+
+    session.stop();
+    const dead = await until(() => {
+      try {
+        process.kill(pid, 0);
+        return false;
+      } catch (error) {
+        return (error as NodeJS.ErrnoException).code === "ESRCH";
+      }
+    }, 2000);
+    expect(dead).toBe(true);
+  });
+
+  it("esmrunandkeep aborted mid-run does not register the capability and cleans up the new file", async () => {
+    const { session, root, cwd } = await open([
+      call(
+        "esmrunandkeep",
+        {
+          name: "latecap",
+          desc: "never finishes",
+          script: [
+            'import { writeFile } from "node:fs/promises";',
+            "export default async () => {",
+            '  await writeFile("cap-started.txt", "1");',
+            "  await new Promise(() => {});",
+            "};",
+          ].join("\n"),
+        },
+        "c-keep-abort",
+      ),
+      stop(),
+    ]);
+
+    session.kernel.nextRun(userMsg("go"));
+    const run = session.runner.run();
+    expect(
+      await until(() => existsSync(join(cwd, "cap-started.txt")), 5000),
+    ).toBe(true);
+
+    session.runner.abort();
+    const res = await run;
+    expect(res.status).toBe("aborted");
+
+    expect(
+      existsSync(join(root, "capabilities")) &&
+        readdirSync(join(root, "capabilities")).some((f) =>
+          f.startsWith("latecap."),
+        ),
+    ).toBe(false);
+    const listed = await session.kernel.tools.execute(
+      "list_capabilities",
+      {},
+      { turn: 1, toolCallId: "c-list" },
+    );
+    expect(JSON.stringify(listed)).not.toContain("latecap");
+
+    // Also test direct tools.execute("esmrunandkeep", ..., { signal }) abort cleanup.
+    const controller = new AbortController();
+    const direct = session.kernel.tools.execute(
+      "esmrunandkeep",
+      {
+        name: "directcap",
+        desc: "never finishes",
+        script: [
+          'import { writeFile } from "node:fs/promises";',
+          "export default async () => {",
+          '  await writeFile("direct-started.txt", "1");',
+          "  await new Promise(() => {});",
+          "};",
+        ].join("\n"),
+      },
+      { turn: 2, toolCallId: "c-direct-keep", signal: controller.signal },
+    );
+    expect(
+      await until(() => existsSync(join(cwd, "direct-started.txt")), 5000),
+    ).toBe(true);
+    controller.abort(new DOMException("aborted", "AbortError"));
+    await expect(direct).rejects.toThrow();
+    expect(
+      existsSync(join(root, "capabilities")) &&
+        readdirSync(join(root, "capabilities")).some((f) =>
+          f.startsWith("directcap."),
+        ),
+    ).toBe(false);
+
     session.stop();
   });
 });

@@ -20,10 +20,9 @@ import type { World } from "./support/world";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { delimiter, join } from "node:path";
-import process from "node:process";
-import { FAKE_AGENT, fakeAgent } from "@eta/runtime-acp/testing";
-import { describe, expect, it, vi } from "vitest";
+import { join } from "node:path";
+import { fakeAgent } from "@eta/runtime-acp/testing";
+import { describe, expect, it } from "vitest";
 import { until } from "./support/client";
 import { machineView } from "./support/daemon";
 import { scriptedModels } from "./support/models";
@@ -78,63 +77,6 @@ async function alone(w: World, agent: AgentView) {
 }
 
 describe("an ACP agent, from the settings page to a reply", () => {
-  it.skipIf(process.platform === "win32")(
-    "offers Antigravity without a config and runs it without MCP servers",
-    async () => {
-      const fake = fakeAgent("antigravity");
-      writeFileSync(
-        join(fake.dir, "agy"),
-        '#!/bin/sh\nexec "$ETA_TEST_BUN" "$ETA_TEST_ACP"\n',
-        { mode: 0o700 },
-      );
-      vi.stubEnv("PATH", [fake.dir, process.env.PATH].join(delimiter));
-      vi.stubEnv("FAKE_ACP_DIR", fake.dir);
-      vi.stubEnv("ETA_TEST_BUN", process.execPath);
-      vi.stubEnv("ETA_TEST_ACP", FAKE_AGENT);
-      try {
-        const w = await host();
-        const config = join(w.host.dataDir, "acp.json");
-        const antigravity = async () => {
-          const { runtimes } = (await w.client.call(
-            "agents",
-            "runtimes",
-            {},
-          )) as {
-            runtimes: AgentRuntimeInfo[];
-          };
-          return runtimes.filter((item) => item.id === "acp.antigravity");
-        };
-        expect(await antigravity()).toMatchObject([
-          {
-            label: "Antigravity",
-            discovered: true,
-            status: "available",
-            models: [{ id: "model-a" }, { id: "model-b" }],
-          },
-        ]);
-        expect(existsSync(config)).toBe(false);
-
-        const agent = await w.agent("Ace", { runtime: "acp.antigravity" });
-        const chat = await alone(w, agent);
-        const sent = await w.send(chat, "hello");
-        const done = await w.settled(chat, sent.replies[0]!.id);
-        expect(done.status).toBe("done");
-        expect(done.text.trim()).not.toBe("");
-        expect(
-          fake.log().filter((entry) => entry.method === "session/new"),
-        ).toMatchObject([{ mcpServers: [] }, { mcpServers: [] }]);
-        expect(existsSync(config)).toBe(false);
-
-        await save(w, { ...fake.config, label: "My Antigravity" });
-        const customized = await antigravity();
-        expect(customized).toMatchObject([{ label: "My Antigravity" }]);
-        expect(customized[0]?.discovered).toBeUndefined();
-      } finally {
-        vi.unstubAllEnvs();
-      }
-    },
-  );
-
   it("is saved, listed as a runtime, and answers an agent's conversation", async () => {
     const w = await host();
     const fake = fakeAgent("fake");
@@ -300,7 +242,9 @@ describe("the acp target", () => {
     const { runtimes } = (await w.client.call("agents", "runtimes", {
       fresh: true,
     })) as { runtimes: AgentRuntimeInfo[] };
-    expect(runtimes.map((runtime) => runtime.id)).not.toContain("acp.moved");
+    expect(runtimes.some((runtime) => runtime.id.startsWith("acp."))).toBe(
+      false,
+    );
   });
 
   it("keeps an id an agent still runs on, and says which agent", async () => {
@@ -455,7 +399,10 @@ describe("an ACP agent on a daemon", () => {
       id: "acp.fake",
       status: "available",
     });
-    const ace = await r.agent("Ace", { runtime: "acp.fake" });
+    const ace = await r.agent("Ace", {
+      runtime: "acp.fake",
+      machineId: r.daemon.machineId,
+    });
     const group = await r.group(r.remoteProject.id, [ace.id]);
     await r.watch(group.id);
     const sent = await r.send(group.id, "state");
@@ -463,8 +410,11 @@ describe("an ACP agent on a daemon", () => {
     expect(done.status).toBe("done");
     expect(JSON.parse(done.text)).toMatchObject({ prompts: 1 });
 
-    // An id only the primary knows does not run there.
-    const lost = await r.agent("Lost", { runtime: "acp.elsewhere" });
+    // An id only the primary knows does not run on the daemon.
+    const lost = await r.agent("Lost", {
+      runtime: "acp.elsewhere",
+      machineId: r.daemon.machineId,
+    });
     const other = await r.group(r.remoteProject.id, [lost.id]);
     await r.watch(other.id);
     const asked = await r.send(other.id, "hello");
@@ -598,35 +548,36 @@ describe("one machine at a time: the settings page on a daemon", () => {
     expect(entry(r)?.agents).toBeDefined();
   });
 
-  it("counts only the agents on that machine as still using an id", async () => {
+  it("counts only the agents pinned to that machine as still using an id", async () => {
     const r = await remoteWorld();
     const machineId = r.daemon.machineId;
     const { config } = fakeAgent("fake");
     await save(r, config);
     await save(r, config, undefined, machineId);
     // Pinned to the daemon: holds the daemon's, not the primary's.
-    await r.agent("Pinned", { runtime: "acp.fake", machineId });
-    // Pinned to none, and in a conversation in the daemon's project: holds the daemon's too.
-    const follower = await r.agent("Follower", { runtime: "acp.fake" });
-    await r.group(r.remoteProject.id, [follower.id]);
+    await r.agent("OnDaemon", { runtime: "acp.fake", machineId });
+    // Pinned to the primary: holds the primary's, not the daemon's.
+    const onPrimary = await r.agent("OnPrimary", { runtime: "acp.fake" });
+    const project = await r.project();
+    await r.group(project.id, [onPrimary.id]);
     await expect(
       r.client.call("acp", "delete", { machineId, id: "fake" }),
-    ).rejects.toThrow(/Cannot delete fake: Follower, Pinned run on acp\.fake/);
+    ).rejects.toThrow(/Cannot delete fake: OnDaemon runs on acp\.fake/);
     await expect(
       save(r, { ...config, id: "moved" }, "fake", machineId),
-    ).rejects.toThrow(/Cannot rename fake: Follower, Pinned run on acp\.fake/);
-    // On the primary only the follower (its home is there) runs on it.
+    ).rejects.toThrow(/Cannot rename fake: OnDaemon runs on acp\.fake/);
+    // On the primary only OnPrimary counts.
     await expect(
       r.client.call("acp", "delete", { id: "fake" }),
-    ).rejects.toThrow(/Cannot delete fake: Follower runs on acp\.fake/);
+    ).rejects.toThrow(/Cannot delete fake: OnPrimary runs on acp\.fake/);
   });
 
-  it("does not count an agent that follows its projects when none is on that machine", async () => {
+  it("ignores agents pinned to another machine even when deleting an ACP definition here", async () => {
     const r = await remoteWorld();
     const machineId = r.daemon.machineId;
     const { config } = fakeAgent("fake");
     await save(r, config, undefined, machineId);
-    // Its home, and so its only project, is on the primary.
+    // Pinned to the primary: its sessions run there, never on the daemon.
     await r.agent("Homebody", { runtime: "acp.fake" });
     expect(
       await r.client.call("acp", "delete", { machineId, id: "fake" }),

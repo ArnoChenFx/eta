@@ -68,13 +68,15 @@ import type { RunRecord, TaskRunStore } from "./runs";
 import type { TaskRecord, TaskStore } from "./store";
 import type { TaskUsageStore } from "./usage";
 import { homedir } from "node:os";
+import { isExternalRuntime } from "@eta/client-contracts";
 import { LinkError } from "@eta/daemon";
 import { shellQuote } from "@eta/ssh";
+import { externalAgentProjectError } from "../agents/bounds";
 import { explainRunError } from "../agents/model";
 import { mentionKey, sessionKeyOf, taskKey } from "../session-owner";
 import { workable } from "./status";
 import { executorOf } from "./store";
-import { prepareWorktree } from "./workspace";
+import { prepareWorktree, removeWorktree } from "./workspace";
 
 /**
  * What a run says when the agent that is to execute the task is not in the registry. It names the
@@ -392,6 +394,40 @@ export class TaskRunner implements TaskRuns {
   stop(taskId: string, why: string): void {
     this.#forget(taskId);
     for (const run of this.#deps.runs.openOf(taskId)) this.#stop(run, why);
+  }
+
+  /**
+   * The task is finished, archived or deleted: take its worktree away if it is clean. A run still
+   * winding down is waited for (a minute at most); a failure is only logged, since the files are
+   * only tidied, never needed.
+   */
+  release(
+    task: {
+      id: string;
+      projectId: string | null;
+      worktreePath: string | null;
+    },
+    attempt = 0,
+  ): void {
+    if (task.worktreePath === null || task.projectId === null) return;
+    if (this.active(task.id) && attempt < 12) {
+      setTimeout(() => this.release(task, attempt + 1), 5000).unref();
+      return;
+    }
+    const project = this.#deps.projects.get(task.projectId);
+    const machine =
+      project === undefined
+        ? undefined
+        : this.#deps.machines.get(project.machineId);
+    if (project === undefined || machine === undefined) return;
+    removeWorktree(this.#deps.transport(machine), {
+      projectPath: project.path,
+      path: task.worktreePath,
+    }).catch((error: unknown) => {
+      console.warn(
+        `[eta] could not remove a task's worktree: ${messageOf(error)}`,
+      );
+    });
   }
 
   withdraw(taskId: string, which: "start" | "executor" = "start"): void {
@@ -754,6 +790,16 @@ export class TaskRunner implements TaskRuns {
       return;
     const maker = agents.get(makerId);
     if (maker === undefined) return;
+    const project =
+      task.projectId === null
+        ? undefined
+        : this.#deps.projects.get(task.projectId);
+    if (
+      project !== undefined &&
+      externalAgentProjectError(maker, project, this.#deps.machines) !==
+        undefined
+    )
+      return;
     const executor = agents.get(this.#executorOf(task) ?? "")?.name;
     this.consult(
       task.id,
@@ -820,13 +866,16 @@ export class TaskRunner implements TaskRuns {
         ? runs.lastSessionOf(task.id, agentId)
         : undefined;
     // The run is on the machine of the agent that works in it — the mentioned agent, else the
-    // executor (the assignee before the maker) — a pinned agent's, else the project's.
+    // executor (the assignee before the maker) — external runtimes use only their pinned machine,
+    // while eta agents fall back to the project's machine.
     const runner = agents.get(agentId ?? this.#executorOf(task) ?? "");
     const machineId =
       runner === undefined
         ? project.machineId
-        : (this.#deps.engine.machineFor(runner, project.machineId)?.id ??
-          project.machineId);
+        : isExternalRuntime(runner.runtime)
+          ? runner.machineId
+          : (this.#deps.engine.machineFor(runner, project.machineId)?.id ??
+            project.machineId);
     // The executor's run that starts the work (a first run, a rerun) waits for the task's
     // dependencies; one woken by a comment carries on work that started, and a mentioned agent
     // only answers.
@@ -892,6 +941,36 @@ export class TaskRunner implements TaskRuns {
       if (gate?.state === "broken") {
         // It will never start on its own: the board blocks the task and withdraws this run.
         board.blockOnCancelled(run.taskId);
+        continue;
+      }
+      const task = this.#deps.tasks.get(run.taskId);
+      const project =
+        task?.projectId == null
+          ? undefined
+          : this.#deps.projects.get(task.projectId);
+      const runnerAgent =
+        task === undefined
+          ? undefined
+          : this.#deps.agents.get(run.agentId ?? this.#executorOf(task) ?? "");
+      const boundProblem =
+        runnerAgent !== undefined && project !== undefined
+          ? (externalAgentProjectError(runnerAgent, project, machines) ??
+            (isExternalRuntime(runnerAgent.runtime) &&
+            run.machineId !== runnerAgent.machineId
+              ? `${runnerAgent.name} runs on ${runnerAgent.runtime} and may only run on its pinned machine`
+              : undefined))
+          : undefined;
+      if (boundProblem !== undefined) {
+        if (runs.start(run.id)) {
+          runs.finish(run.id, "failed", boundProblem);
+          board.runEvent(run.taskId, {
+            kind: "run_failed",
+            runId: run.id,
+            actor: actorOf(run),
+            body: boundProblem,
+          });
+          this.#waiting.delete(laneKey(run));
+        }
         continue;
       }
       let reason: TaskQueueReason | null = null;
@@ -1046,6 +1125,20 @@ export class TaskRunner implements TaskRuns {
     if (project === undefined)
       return {
         ended: { status: "failed", error: "The task's project is gone." },
+      };
+    const boundProblem = externalAgentProjectError(
+      agent,
+      project,
+      this.#deps.machines,
+    );
+    if (boundProblem !== undefined)
+      return { ended: { status: "failed", error: boundProblem } };
+    if (isExternalRuntime(agent.runtime) && machine.id !== agent.machineId)
+      return {
+        ended: {
+          status: "failed",
+          error: `${agent.name} runs on ${agent.runtime} and may only run on its pinned machine.`,
+        },
       };
 
     // Where it works. A run on another machine than the project's (its agent is pinned there) has

@@ -13,6 +13,7 @@ import type { Timeline } from "../conversations/timeline";
 import type { MachineRecord, MachineStore } from "../machines/store";
 import type { ProjectRecord, ProjectStore } from "../projects/store";
 import type { ProposalKind, ProposalOrigin } from "./proposals";
+import { checkExternalAgentProject } from "../agents/bounds";
 import { isAgentHome } from "../agents/home";
 import { createGroup, groupNamed } from "../conversations/groups";
 
@@ -137,6 +138,17 @@ export function groupProposals(
         const clash = groupNamed(deps.conversations, project.id, name);
         if (clash !== undefined) throw new GroupConflictError(name, clash.id);
       }
+      const targetProject = project ?? {
+        kind: "project" as const,
+        ownerAgentId: null,
+        machineId: machine.id,
+      };
+      for (const agentId of memberIds)
+        checkExternalAgentProject(
+          deps.agents.get(agentId)!,
+          targetProject,
+          deps.machines,
+        );
       return {
         name,
         goal: input.goal?.trim() || null,
@@ -195,7 +207,7 @@ export function groupProposals(
     created: (proposal, result) => [
       `conversationId: ${result.conversationId}`,
       `projectId: ${result.projectId}${result.projectCreated ? ` (${proposal.path} was added as a new project)` : ""}`,
-      "Assign work there with assign_in_group.",
+      "Dispatch tasks there with dispatch_task or coordinate in chat with assign_in_group.",
     ],
   };
 }

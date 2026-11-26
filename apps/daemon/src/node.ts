@@ -45,7 +45,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { homedir, hostname, platform } from "node:os";
 import { join } from "node:path";
 import process from "node:process";
-import { LINK_PROTOCOL } from "@eta/client-contracts";
+import { LINK_LIMITS, LINK_PROTOCOL } from "@eta/client-contracts";
 import { kernelOn } from "@eta/core";
 import { createRefreshDedupingFetch } from "@eta/mcp";
 import { Places } from "@eta/places";
@@ -230,8 +230,8 @@ export class DaemonNode {
     });
     this.#manager = new SessionManager({
       store: this.#store,
-      // Claude Code, Codex, OpenCode, Pi, Grok Build: an agent on one of them runs
-      // it on this machine.
+      // Claude Code, Codex, OpenCode, Pi, Antigravity, Grok Build, Qwen Code: an agent on one of
+      // them runs it on this machine.
       runtimes: this.#runtimes,
       // Generation is the primary's: this is a model layer that asks it.
       modelsFor: (meta) =>
@@ -568,6 +568,8 @@ export class DaemonNode {
         protocol: LINK_PROTOCOL,
         platform: daemonPlatform(),
         install: this.#options.install ?? installKind(),
+        chunked: true,
+        maxMessageBytes: LINK_LIMITS.maxMessageBytes,
       }),
       open: (args) => this.#open(args),
       catalog: ({ models }) => {
@@ -628,12 +630,13 @@ export class DaemonNode {
    */
   async #open(args: OpenSessionArgs): Promise<{ session: string }> {
     const sessions = this.#service();
+    const external = args.runtime !== undefined && args.runtime !== "eta";
     if (args.modelSpec !== undefined) this.#catalog.add(args.modelSpec);
     this.#openings.set(keyOf(args.conversationId, args.agentId), {
       prompt: args.agentPrompt,
       stamp: args.stamp,
       tools: args.tools,
-      cards: (args.personaCards ?? []) as PersonaCard[],
+      cards: external ? [] : ((args.personaCards ?? []) as PersonaCard[]),
       plugins: await this.#openedPlugins(args),
       servers: args.mcpServers ?? [],
       redact: args.redactions ?? [],
@@ -658,7 +661,8 @@ export class DaemonNode {
           throw new Error(`no such session on ${args.runtime ?? "eta"}: ${id}`);
         if (this.#opened.get(id) !== args.stamp) {
           await sessions.setMeta(id, {
-            persona: args.persona === undefined ? undefined : args.persona,
+            persona:
+              external || args.persona === undefined ? undefined : args.persona,
           });
           await sessions.close(id);
           await sessions.open(id);
@@ -679,7 +683,9 @@ export class DaemonNode {
       conversationId: args.conversationId,
       ...(args.runtime === undefined ? {} : { runtime: args.runtime }),
       ...(args.model === undefined ? {} : { model: args.model }),
-      ...(args.persona === undefined ? {} : { persona: args.persona }),
+      ...(external || args.persona === undefined
+        ? {}
+        : { persona: args.persona }),
     });
     await thinking(id);
     return { session: id };

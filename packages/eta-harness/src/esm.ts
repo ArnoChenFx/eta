@@ -14,8 +14,9 @@
  * - `eta.ask`, a nested turn of this same agent, with tools and the history;
  * - `search` / `view` / `edit` / `$` and `node:*`, resolved in the session cwd.
  *
- * Every script a run evaluates is written to disk first (`runs/`), so the code
- * the model ran is a file, not something that only lived in memory.
+ * A script is evaluated from memory under a virtual name in `runs/`; nothing is written there
+ * for it, because the session's history already holds the code the model ran. Only a result too
+ * long for the model's context goes to a file in `runs/`.
  */
 import type {
   AgentMessage,
@@ -30,6 +31,7 @@ import type {
   AskRequest,
   AskResult,
   Effect,
+  EffectScopeHandle,
   Layer,
   PlatformCall,
 } from "./realm";
@@ -162,6 +164,38 @@ const show = (value: unknown): string => {
     return String(value);
   }
 };
+
+/**
+ * A promise the run can stop waiting for: the script itself cannot be stopped,
+ * but the abort ends the evaluation that is parked on it.
+ */
+function abortable<T>(
+  work: Promise<T>,
+  signal: AbortSignal | undefined,
+): Promise<T> {
+  if (signal === undefined) return work;
+  if (signal.aborted) {
+    void work.catch(() => undefined);
+    return Promise.reject(signal.reason);
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => {
+      signal.removeEventListener("abort", onAbort);
+      reject(signal.reason);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    work.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
 
 const effectLine = (effect: Effect): string =>
   `${effect.status === "ok" ? "" : `[${effect.status}] `}${effect.name} ${effect.detail} (line ${effect.at.line})`;
@@ -310,7 +344,7 @@ function askHistory(transcript: readonly AgentMessage[]): Message[] {
 }
 
 const ESMRUN_DESCRIPTION = [
-  "Run JavaScript in this session's ESM realm. The script is a module (imports, top-level await); its last expression is the result, or `export default` it. Relative paths, `$` and `search` resolve in the session cwd. Every script is saved under the session's runs/ directory.",
+  "Run JavaScript in this session's ESM realm. The script is a module (imports, top-level await); its last expression is the result, or `export default` it. Relative paths, `$` and `search` resolve in the session cwd.",
   'Prefer search/view/edit over `$` for files. Bare imports (`import pg from "pg"`) are installed from npm on first use.',
   "Default to esmrun; use esmrunandkeep only for something you will call again.",
 ].join(" ");
@@ -520,6 +554,7 @@ export function openEsmSession(options: EsmSessionOptions): EsmSession {
       platform,
       state: etaState,
       ask,
+      signal: () => frames.getStore()?.signal,
       ...(options.mcp === undefined ? {} : { mcp: frameMcp(options.mcp) }),
       onConsole: (level, line) => {
         frames
@@ -539,11 +574,10 @@ export function openEsmSession(options: EsmSessionOptions): EsmSession {
       toolCallId: string;
       turn: number;
       signal?: AbortSignal | undefined;
+      onAbortResult?: ((snapshot: () => unknown) => void) | undefined;
     },
     timeoutMs: number | undefined,
   ): Promise<ToolResult> => {
-    mkdirSync(dirname(file), { recursive: true });
-    writeFileSync(file, source, "utf8");
     const frame: Frame = {
       toolCallId: call.toolCallId,
       turn: call.turn,
@@ -558,18 +592,76 @@ export function openEsmSession(options: EsmSessionOptions): EsmSession {
     const parts: string[] = [];
     let isError = false;
     let effects: Effect[] = [];
+    let scopeHandle: EffectScopeHandle | undefined;
+    let sealedOnAbort = false;
+
+    const buildAbortResult = (): ToolResult => {
+      sealedOnAbort = true;
+      const snapshotEffects = scopeHandle?.seal() ?? [];
+      const abortSections = ["Tool execution was cancelled before completion."];
+      if (snapshotEffects.length > 0)
+        abortSections.push(
+          `effects:\n${snapshotEffects.map(effectLine).join("\n")}`,
+        );
+      if (frame.console.length > 0)
+        abortSections.push(`console:\n${frame.console.join("\n")}`);
+      for (const one of frame.asks)
+        abortSections.push(`eta.ask [${one.status}] ${one.stack.join(" > ")}`);
+      abortSections.push(`script: ${file}`);
+      return {
+        isError: true,
+        content: [{ type: "text", text: abortSections.join("\n\n") }],
+        details: {
+          aborted: true,
+          file,
+          effects: snapshotEffects,
+          calls: frame.calls.slice(),
+          asks: frame.asks.slice(),
+          stack: frame.stack.slice(),
+        },
+      };
+    };
+
+    call.onAbortResult?.(buildAbortResult);
+
+    // A cancelled run ends the evaluation, not only the calls the script makes:
+    // a script parked on an await that never settles stops with it.
+    let cancelled = false;
+    let cancellation: unknown;
+    const ensureNotAborted = (): void => {
+      if (call.signal?.aborted === true) throw call.signal.reason;
+    };
     await hydrate();
     await frames.run(frame, async () => {
       try {
+        ensureNotAborted();
         const realm = agent.realm();
         const module = snippetSource(source, (s) => realm.parses(s));
-        const result = await agent.run(module, {
-          identifier: file,
-          ...(timeoutMs === undefined ? {} : { timeoutMs }),
-        });
+        await abortable(agent.wake(), call.signal);
+        ensureNotAborted();
+        const result = await abortable(
+          agent.realm().evaluate(module, {
+            identifier: file,
+            ...(timeoutMs === undefined ? {} : { timeoutMs }),
+            onScope: (handle) => {
+              scopeHandle = handle;
+              if (sealedOnAbort) handle.seal();
+            },
+          }),
+          call.signal,
+        );
         effects = result.effects;
         parts.push(show(result.value));
       } catch (error) {
+        // The run was cancelled while the script ran: that is not the script
+        // failing, and the kernel reports the call as cancelled like any other.
+        if (call.signal?.aborted === true) {
+          sealedOnAbort = true;
+          scopeHandle?.seal();
+          cancelled = true;
+          cancellation = error;
+          return;
+        }
         isError = true;
         parts.push(
           `Error: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`,
@@ -583,9 +675,12 @@ export function openEsmSession(options: EsmSessionOptions): EsmSession {
         `(eta.state was not saved: ${error instanceof Error ? error.message : String(error)})`,
       );
     }
+    // Thrown after the flush: what the script already changed is still saved.
+    if (cancelled) throw cancellation;
     let text = parts.join("\n");
     if (text.length > RESULT_CHARS) {
       const full = `${file.replace(/\.js$/, "")}.out.txt`;
+      mkdirSync(dirname(full), { recursive: true });
       writeFileSync(full, text, "utf8");
       text = `${text.slice(0, RESULT_CHARS)}\n… (${text.length} chars; full output: ${full})`;
     }
@@ -601,7 +696,6 @@ export function openEsmSession(options: EsmSessionOptions): EsmSession {
       sections.push(
         `images: the tools answered with ${frame.images.length}; the first ${images.length} are attached, ${frame.images.length - images.length} left out. Fetch fewer per script to see the rest.`,
       );
-    sections.push(`script: ${file}`);
     return {
       content: [
         { type: "text", text: sections.join("\n\n") },
@@ -746,6 +840,9 @@ export function openEsmSession(options: EsmSessionOptions): EsmSession {
       const existed = existsSync(file);
       mkdirSync(capsDir, { recursive: true });
       writeFileSync(file, args.script, "utf8");
+      const cleanup = (): void => {
+        if (!existed) rmSync(file, { force: true });
+      };
       // A function written into the wrapper module, not a string: a string is compiled
       // outside any module and has no dynamic import. Its literals keep `toString()` (what
       // define persists) free of outside names.
@@ -760,14 +857,32 @@ export function openEsmSession(options: EsmSessionOptions): EsmSession {
         `eta.define(${JSON.stringify(args.name)}, ${source}, ${JSON.stringify({ desc: args.desc })});`,
         `export default value;`,
       ].join("\n");
-      const result = await evaluate(
-        wrapper,
-        join(runsDir, `${stamp(run.call)}.js`),
-        run.call,
-        undefined,
-      );
+      let result: ToolResult;
+      try {
+        result = await evaluate(
+          wrapper,
+          join(runsDir, `${stamp(run.call)}.js`),
+          {
+            ...run.call,
+            ...(run.call.onAbortResult === undefined
+              ? {}
+              : {
+                  onAbortResult: (snapshot) => {
+                    run.call.onAbortResult?.(() => {
+                      cleanup();
+                      return snapshot();
+                    });
+                  },
+                }),
+          },
+          undefined,
+        );
+      } catch (error) {
+        cleanup();
+        throw error;
+      }
       if (result.isError === true) {
-        if (!existed) rmSync(file, { force: true });
+        cleanup();
         return result;
       }
       const first = result.content[0] as { type: "text"; text: string };
