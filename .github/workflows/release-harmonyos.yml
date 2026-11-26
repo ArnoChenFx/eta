@@ -1,5 +1,6 @@
 # A `harmonyos-v*` tag builds the unsigned HarmonyOS / OpenHarmony 7.0 (API 26)
-# HAP for `apps/mobile` and publishes it to a GitHub Release with SHA256SUMS.
+# HAP for `apps/client` (full client: settings, plugins, routines, tasks, chat)
+# and publishes it to a GitHub Release with SHA256SUMS.
 # Manual runs (`workflow_dispatch`) build and upload the HAP as a workflow artifact.
 name: Release HarmonyOS
 
@@ -9,11 +10,11 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: App version (defaults to apps/mobile/nsh.json)
+        description: App version (defaults to apps/client/nsh.json)
         required: false
         default: ""
       build:
-        description: App build number (defaults to apps/mobile/nsh.json)
+        description: App build number (defaults to apps/client/nsh.json)
         required: false
         default: ""
 
@@ -55,10 +56,10 @@ jobs:
             version="${{ inputs.version }}"
             build="${{ inputs.build }}"
             if [[ -z "$version" ]]; then
-              version=$(jq -r '.version' apps/mobile/nsh.json)
+              version=$(jq -r '.version' apps/client/nsh.json)
             fi
             if [[ -z "$build" ]]; then
-              build=$(jq -r '.build' apps/mobile/nsh.json)
+              build=$(jq -r '.build' apps/client/nsh.json)
             fi
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -124,50 +125,48 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             ~/.nsh/nshms
-            apps/mobile/.nsh/platforms/harmonyos/target
-            apps/mobile/.nsh/harmonyos/runner/target
-          key: harmonyos-rust-${{ hashFiles('apps/mobile/nsh.lock', 'apps/mobile/native/Cargo.lock') }}
+            apps/client/.nsh/platforms/harmonyos/target
+            apps/client/.nsh/harmonyos/runner/target
+          key: harmonyos-client-rust-${{ hashFiles('apps/client/nsh.lock') }}
           restore-keys: |
-            harmonyos-rust-
-
-      - name: Align apps/mobile with installed nightly nsh and apply version
-        run: |
-          # Keep apps/mobile/native pinned to the installed nightly nsh revision.
-          rev=$(nsh --version | sed -n 's/.*(\([0-9a-f]\{7,40\}\).*/\1/p')
-          if [[ -n "$rev" ]]; then
-            full_rev=$(gh api "repos/longbridge/nsh/commits/$rev" --jq .sha || echo "$rev")
-            sed -i -E "s/rev = \"[0-9a-f]+\"/rev = \"$full_rev\"/g" apps/mobile/native/Cargo.toml
-          fi
-          tmp=$(mktemp)
-          jq --arg v "${{ steps.meta.outputs.version }}" --argjson b "${{ steps.meta.outputs.build }}" \
-            '.version = $v | .build = $b' apps/mobile/nsh.json > "$tmp"
-          mv "$tmp" apps/mobile/nsh.json
-        env:
-          GH_TOKEN: ${{ github.token }}
+            harmonyos-client-rust-
 
       - name: Prepare patched nsh-platform-harmonyos source
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          commit=$(jq -r '.packages[] | select(.name == "nsh-platform-harmonyos") | .commit' apps/mobile/nsh.lock)
+          commit=$(jq -r '.packages[] | select(.name == "nsh-platform-harmonyos") | .commit' apps/client/nsh.lock)
+          rev=$(nsh --version | sed -n 's/.*(\([0-9a-f]\{7,40\}\).*/\1/p')
+          full_rev=""
+          if [[ -n "$rev" ]]; then
+            full_rev=$(gh api "repos/longbridge/nsh/commits/$rev" --jq .sha || echo "$rev")
+          fi
           src="$RUNNER_TEMP/nsh-platform-harmonyos-src"
           rm -rf "$src"
           git clone https://github.com/huacnlee/nsh-platform-harmonyos.git "$src"
           git -C "$src" checkout "$commit"
-          python3 apps/mobile/scripts/patch-harmonyos.py platform "$src"
+          if [[ -n "$full_rev" ]]; then
+            python3 apps/mobile/scripts/patch-harmonyos.py platform "$src" --nsh-rev "$full_rev"
+          else
+            python3 apps/mobile/scripts/patch-harmonyos.py platform "$src"
+          fi
           echo "NSH_HARMONYOS_SOURCE=$src" >> "$GITHUB_ENV"
 
       - name: Build native library and generate OpenHarmony project
-        working-directory: apps/mobile
         run: |
           export OHOS_BASE_SDK_HOME="$HOME/ohos-sdk"
           export OHOS_NDK_HOME="$HOME/ohos-sdk/26.0.0"
           export HVIGOR_HOME="$HOME/hvigor"
-          nsh package App.tsx --target harmonyos --runtime-os openharmony --no-hap -o "$RUNNER_TEMP/eta-mobile-harmonyos-out" -v
+          bun run client:package --target harmonyos --runtime-os openharmony --no-hap \
+            --app-version "${{ steps.meta.outputs.version }}" \
+            --build "${{ steps.meta.outputs.build }}" \
+            --out "$RUNNER_TEMP/eta-client-harmonyos-out" -v
 
       - name: Assemble unsigned HAP with hvigor
         run: |
           export NODE_PATH="$HOME/hvigor/node_modules"
           export OHOS_BASE_SDK_HOME="$HOME/ohos-sdk"
-          out="$RUNNER_TEMP/eta-mobile-harmonyos-out"
+          out="$RUNNER_TEMP/eta-client-harmonyos-out"
           python3 apps/mobile/scripts/patch-harmonyos.py project "$out"
           cd "$out"
           node "$HOME/hvigor/node_modules/@ohos/hvigor/bin/hvigor.js" assembleHap \
@@ -177,16 +176,16 @@ jobs:
         run: |
           stage="$RUNNER_TEMP/harmonyos-release"
           mkdir -p "$stage"
-          hap=$(find "$RUNNER_TEMP/eta-mobile-harmonyos-out/entry/build" -type f -name '*.hap' | head -n 1)
+          hap=$(find "$RUNNER_TEMP/eta-client-harmonyos-out/entry/build" -type f -name '*.hap' | head -n 1)
           test -f "$hap"
-          name="Eta-mobile-${{ steps.meta.outputs.version }}-unsigned.hap"
+          name="Eta-client-${{ steps.meta.outputs.version }}-unsigned.hap"
           cp "$hap" "$stage/$name"
           (cd "$stage" && sha256sum "$name" > SHA256SUMS)
           ls -lh "$stage"
 
       - uses: actions/upload-artifact@v7
         with:
-          name: eta-mobile-harmonyos-${{ steps.meta.outputs.version }}
+          name: eta-client-harmonyos-${{ steps.meta.outputs.version }}
           if-no-files-found: error
           path: ${{ runner.temp }}/harmonyos-release/*
 

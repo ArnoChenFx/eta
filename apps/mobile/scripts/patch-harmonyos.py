@@ -21,8 +21,9 @@ def replace_once(path: pathlib.Path, old: str, new: str) -> None:
     path.write_text(text.replace(old, new, 1), encoding="utf-8")
 
 
-def patch_platform(root: pathlib.Path) -> None:
-    # 1. Cargo.toml: bump nsh-* workspace deps from 0.6 to 0.7 so [patch.crates-io] applies.
+def patch_platform(root: pathlib.Path, nsh_rev: str | None = None) -> None:
+    # 1. Cargo.toml: bump nsh-* workspace deps from 0.6 to 0.7 so [patch.crates-io] applies,
+    #    and enable the `websocket` feature on `nsh-engine`.
     cargo = root / "Cargo.toml"
     text = cargo.read_text(encoding="utf-8")
     for old, new in [
@@ -36,6 +37,17 @@ def patch_platform(root: pathlib.Path) -> None:
     ]:
         text = text.replace(old, new)
     cargo.write_text(text, encoding="utf-8")
+
+    if nsh_rev:
+        lock = root / "Cargo.lock"
+        if lock.exists():
+            lock_text = lock.read_text(encoding="utf-8")
+            lock_text = re.sub(
+                r"(git\+https://github\.com/longbridge/nsh\?branch=main#)[0-9a-f]{40}",
+                rf"\g<1>{nsh_rev}",
+                lock_text,
+            )
+            lock.write_text(lock_text, encoding="utf-8")
 
     # 2. src/app/chunks.rs: Bundle::url_schemes removed in nsh 0.7.0.
     replace_once(
@@ -262,12 +274,21 @@ export class NativeSpeech {
 
 
 def main() -> int:
-    if len(sys.argv) != 3 or sys.argv[1] not in ("platform", "project"):
-        print("usage: patch-harmonyos.py <platform|project> <dir>", file=sys.stderr)
+    args = sys.argv[1:]
+    nsh_rev: str | None = None
+    if "--nsh-rev" in args:
+        idx = args.index("--nsh-rev")
+        if idx + 1 >= len(args):
+            print("error: --nsh-rev requires a commit SHA", file=sys.stderr)
+            return 2
+        nsh_rev = args[idx + 1]
+        args = args[:idx] + args[idx + 2 :]
+    if len(args) != 2 or args[0] not in ("platform", "project"):
+        print("usage: patch-harmonyos.py <platform|project> <dir> [--nsh-rev SHA]", file=sys.stderr)
         return 2
-    target = pathlib.Path(sys.argv[2])
-    if sys.argv[1] == "platform":
-        patch_platform(target)
+    target = pathlib.Path(args[1])
+    if args[0] == "platform":
+        patch_platform(target, nsh_rev=nsh_rev)
     else:
         patch_project(target)
     return 0
