@@ -227,7 +227,6 @@ try {
         },
         harmonyos: {
           permissions: [
-            { name: "ohos.permission.GET_NETWORK_INFO" },
             {
               name: "ohos.permission.CAMERA",
               reason: "Scan an Eta pairing code to connect to your host.",

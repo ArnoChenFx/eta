@@ -124,33 +124,11 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-            ~/.nsh/nshms
             apps/client/.nsh/platforms/harmonyos/target
             apps/client/.nsh/harmonyos/runner/target
           key: harmonyos-client-rust-${{ hashFiles('apps/client/harmonyos.nsh.lock') }}
           restore-keys: |
             harmonyos-client-rust-
-
-      - name: Prepare patched nsh-platform-harmonyos source
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          commit=$(jq -r '.packages[] | select(.name == "nsh-platform-harmonyos") | .commit' apps/client/harmonyos.nsh.lock)
-          rev=$(nsh --version | sed -n 's/.*(\([0-9a-f]\{7,40\}\).*/\1/p')
-          full_rev=""
-          if [[ -n "$rev" ]]; then
-            full_rev=$(gh api "repos/longbridge/nsh/commits/$rev" --jq .sha || echo "$rev")
-          fi
-          src="$RUNNER_TEMP/nsh-platform-harmonyos-src"
-          rm -rf "$src"
-          git clone https://github.com/huacnlee/nsh-platform-harmonyos.git "$src"
-          git -C "$src" checkout "$commit"
-          if [[ -n "$full_rev" ]]; then
-            python3 scripts/patch-harmonyos.py platform "$src" --nsh-rev "$full_rev"
-          else
-            python3 scripts/patch-harmonyos.py platform "$src"
-          fi
-          echo "NSH_HARMONYOS_SOURCE=$src" >> "$GITHUB_ENV"
 
       - name: Build native library and generate OpenHarmony project
         run: |

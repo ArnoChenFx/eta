@@ -5,7 +5,7 @@
       "name": "nsh-platform-harmonyos",
       "version": "0.1.1",
       "source": "git+https://github.com/huacnlee/nsh-platform-harmonyos",
-      "commit": "eceb14b55767f8ee5d56d860b93988fb709a8b3e",
+      "commit": "df627d88014cd75bcaa19a6b2f65f0318cfcc56d",
       "dir": "github.com/huacnlee/nsh-platform-harmonyos/0.1.1",
       "platform": "harmonyos"
     }
