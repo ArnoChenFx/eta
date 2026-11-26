@@ -196,10 +196,6 @@ jobs:
         run: |
           stage="$RUNNER_TEMP/harmonyos-release"
           draft=$(gh release view "$TAG" --json isDraft --jq .isDraft || echo none)
-          if [[ "$draft" == "false" ]]; then
-            echo "::error::$TAG is already published."
-            exit 1
-          fi
           if [[ "$draft" == "none" ]]; then
             previous=$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" \
               --jq '.[] | select(.draft | not) | .tag_name' |
@@ -210,4 +206,6 @@ jobs:
               --prerelease="$([[ "$TAG" == *-* && "${TAG#harmonyos-v}" == *-* ]] && echo true || echo false)"
           fi
           gh release upload "$TAG" "$stage"/* --clobber
-          gh release edit "$TAG" --draft=false
+          if [[ "$draft" != "false" ]]; then
+            gh release edit "$TAG" --draft=false
+          fi
