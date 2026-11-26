@@ -127,7 +127,7 @@ jobs:
             ~/.nsh/nshms
             apps/client/.nsh/platforms/harmonyos/target
             apps/client/.nsh/harmonyos/runner/target
-          key: harmonyos-client-rust-${{ hashFiles('apps/client/nsh.lock') }}
+          key: harmonyos-client-rust-${{ hashFiles('apps/client/harmonyos.nsh.lock') }}
           restore-keys: |
             harmonyos-client-rust-
 
@@ -135,7 +135,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          commit=$(jq -r '.packages[] | select(.name == "nsh-platform-harmonyos") | .commit' apps/client/nsh.lock)
+          commit=$(jq -r '.packages[] | select(.name == "nsh-platform-harmonyos") | .commit' apps/client/harmonyos.nsh.lock)
           rev=$(nsh --version | sed -n 's/.*(\([0-9a-f]\{7,40\}\).*/\1/p')
           full_rev=""
           if [[ -n "$rev" ]]; then

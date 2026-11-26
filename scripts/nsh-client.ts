@@ -178,11 +178,13 @@ try {
         file.endsWith(".tsx") ||
         file.endsWith(".ts") ||
         file === "assets" ||
-        file === "src" ||
-        file === "nsh.lock"
+        file === "src"
       )
         cpSync(join(cwd, file), join(staging, file), { recursive: true });
     }
+    const harmonyosLock = join(cwd, "harmonyos.nsh.lock");
+    if (existsSync(harmonyosLock))
+      copyFileSync(harmonyosLock, join(staging, "nsh.lock"));
     const stagingNsh = join(staging, ".nsh");
     mkdirSync(stagingNsh, { recursive: true });
     for (const dir of ["platforms", "harmonyos"]) {
@@ -206,6 +208,21 @@ try {
           cwd,
           meta.icon.harmonyos ?? meta.icon.android ?? "../web/public/Eta-Logo.png",
         ),
+        dependencies: {
+          "nsh-platform-harmonyos": {
+            github: "huacnlee/nsh-platform-harmonyos",
+          },
+        },
+        harmonyos: {
+          permissions: [
+            { name: "ohos.permission.GET_NETWORK_INFO" },
+            {
+              name: "ohos.permission.CAMERA",
+              reason: "Scan an Eta pairing code to connect to your host.",
+              when: "inuse",
+            },
+          ],
+        },
         ...(appVersion ? { version: appVersion } : {}),
         ...(appBuild ? { build: Number(appBuild) } : {}),
       }),
